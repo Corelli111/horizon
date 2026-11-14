@@ -1212,6 +1212,9 @@ impl Game<'_> {
             None
         };
         let server = self.serving.is_some() || self.options.dedicated.is_some();
+        if server && running.is_some() {
+            self.regions.prof.begin();
+        }
         if server {
             self.run_requested_saves();
         }
@@ -1341,6 +1344,7 @@ impl Game<'_> {
             let _span = horizon_client::spans::guard("mods_server_tick_end");
             self.native_lifecycle_server_tick_end(paused);
         }
+        self.regions.prof.end();
         Ok(())
     }
 
