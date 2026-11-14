@@ -1516,7 +1516,7 @@ impl Game<'_> {
     }
 }
 
-fn server_game(
+pub(super) fn server_game(
     res: &Arc<Resources>,
     pack: PackResources,
     options: Options,
