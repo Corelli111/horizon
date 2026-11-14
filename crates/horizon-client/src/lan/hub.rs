@@ -2946,29 +2946,6 @@ impl Hub {
         self.replay.append(&mut self.away_events);
     }
 
-    /// A region's players' chunks on its own thread, after its tick: a region owns every chunk its players see,
-    /// so nothing else reads them meanwhile. The server's hub skips these players once (`Guest::chunks_done`).
-    pub fn region_chunks(&mut self, world: &World) {
-        if self.far.is_some() || self.guests.is_empty() {
-            return;
-        }
-        self.update_chunks_in(world, None);
-        let dimension = self.config.dimension.clone();
-        for g in &mut self.guests {
-            g.chunks_done = g.placed && g.dimension == dimension;
-        }
-    }
-
-    /// A region's block and light changes to its own players, after [`Self::region_chunks`]: its logs are drained
-    /// here, so the server's hub sends only what changes after the regions are back.
-    pub fn region_changes(&mut self, world: &mut World) {
-        if self.far.is_some() || self.guests.is_empty() || world.block_log.is_none() || world.light_log.is_none() {
-            return;
-        }
-        self.broadcast_light_changes(world);
-        self.broadcast_block_changes(world);
-    }
-
     fn update_chunks_in(&mut self, world: &World, streaming: Option<&crate::streaming::Streaming>) {
         if let Some(far) = self.far.as_mut() {
             far.poll();
@@ -2976,9 +2953,6 @@ impl Hub {
         let watching = self.chunk_watches.recording();
         let mut batches = Vec::new();
         for i in 0..self.guests.len() {
-            if std::mem::take(&mut self.guests[i].chunks_done) {
-                continue;
-            }
             if self.watches(&self.guests[i]) {
                 self.update_view(i, watching);
                 if let Some(batch) = self.next_batch(i, world, ctx.streaming) {
@@ -3527,16 +3501,6 @@ impl Hub {
     }
 
     /// All entities as one client sees them: the world's and the other players.
-    /// A region's entities tracked for its players on its thread (its tracker holds their states, from
-    /// [`Self::lend_trackers`]), after its chunks: the server's hub skips these players once.
-    pub fn region_track(&mut self, ctx: &mut TickCtx) {
-        self.track_entities(ctx);
-        let dimension = self.config.dimension.clone();
-        for g in &mut self.guests {
-            g.tracked_done = g.placed && g.dimension == dimension;
-        }
-    }
-
     /// The level's entity states for the region trackers, by the chunk each was last seen in.
     pub fn lend_trackers(&mut self, regions: usize, region_of: impl Fn((i32, i32)) -> Option<usize>) -> Vec<Entities> {
         self.entities.entry(self.config.dimension.clone()).or_default().lend(regions, region_of)
@@ -3555,20 +3519,6 @@ impl Hub {
     }
 
     pub(in crate::lan) fn track_entities(&mut self, ctx: &mut TickCtx) {
-        // The players whose region tracked their entities this tick are left out, once; with nobody left the
-        // level's tracker waits (its parked states stay the regions').
-        let skipped: crate::fast_hash::FxHashSet<u32> = self
-            .guests
-            .iter_mut()
-            .filter_map(|g| std::mem::take(&mut g.tracked_done).then_some(g.conn))
-            .collect();
-        if !skipped.is_empty() {
-            let dimension = &self.config.dimension;
-            let others = self.guests.iter().any(|g| g.placed && g.dimension == *dimension && !skipped.contains(&g.conn));
-            if !others {
-                return;
-            }
-        }
         if let Some(level) = self.entities.get_mut(&self.config.dimension) {
             level.unpark();
         }
@@ -3636,7 +3586,7 @@ impl Hub {
         // not among the entities shown; then the clients viewing the level (`viewed_levels`).
         let mut views = self.view_outs();
         let here = |g: &Guest| {
-            g.participates_online() && (g.placed || g.held) && g.dimension == *dimension && !skipped.contains(&g.conn)
+            g.participates_online() && (g.placed || g.held) && g.dimension == *dimension
         };
         outs.resize_with(self.guests.iter().filter(|g| here(g)).count(), Vec::new);
         // The prediction's replay excuses a client that may still have an entity that left it.
