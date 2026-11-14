@@ -469,7 +469,7 @@ impl Game<'_> {
         if self
             .lan
             .as_ref()
-            .is_none_or(|host| host.hub.guests.iter().all(|g| !g.placed))
+            .is_none_or(|host| host.hub.guests.iter().all(|g| !g.placed) && !host.hub.has_roster_others())
         {
             return;
         }
@@ -479,6 +479,7 @@ impl Game<'_> {
         };
         host.hub.teams.clone_from(&self.score.board.teams);
         let view = horizon_client::lan::scoreboard::View::of(&self.score.board);
+        host.hub.sync_scoreboard_others(&view);
         host.hub.guests.update_all(|g| {
             if g.placed && g.scoreboard != view {
                 g.send_all(&g.scoreboard.changes(&view));
