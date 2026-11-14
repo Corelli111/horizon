@@ -373,6 +373,7 @@ impl Game<'_> {
 impl Game<'_> {
     /// Save the level in place: its changed chunks, its entities and its raids.
     pub(super) fn save_level(&mut self, wait: bool) -> Result<()> {
+        self.land_residents();
         self.admit_level_save()?;
         self.save_border();
         self.save_chunk_tickets()?;

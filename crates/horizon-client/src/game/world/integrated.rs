@@ -1061,6 +1061,7 @@ impl Game<'_> {
     /// `MinecraftServer.stopServer`: the players are saved and sent away,
     /// then the world is saved.
     pub(super) fn stop_integrated(&mut self, crashed: bool) -> Result<()> {
+        self.land_residents();
         // Abort background terrain generation/decoration on shutdown, matching vanilla behavior.
         self.streaming.abort_generation();
         // The close request: lifecycle observation stops.
