@@ -1145,6 +1145,9 @@ impl Game<'_> {
                     g.uuid,
                 )
             })
+            .chain(self.away_server_players().into_iter().map(|(id, uuid)| {
+                mod_api::__private::game::player_ref(mod_api::EntityRef::new(epoch, id), uuid)
+            }))
             .collect()
     }
 
@@ -1314,7 +1317,11 @@ impl Game<'_> {
             return false;
         };
         let Some(g) = host.hub.online_players().find(|g| g.uuid == uuid) else {
-            return false;
+            let mut sent = false;
+            for packet in packets {
+                sent |= self.queue_for_away(uuid, packet, false);
+            }
+            return sent;
         };
         for packet in &packets {
             host.hub.send_to(g.conn, packet);
