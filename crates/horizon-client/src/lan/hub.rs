@@ -334,6 +334,42 @@ fn take_tracking(
     }
 }
 
+/// Whether a player's packet stays inside the player's region, so its region thread handles it. What reaches
+/// other players or the whole server (chat, commands, respawning, settings, mod messages) is the server's.
+pub(crate) fn region_local(p: &S) -> bool {
+    matches!(
+        p,
+        S::AcceptTeleportation(_)
+            | S::PlayerAbilities(_)
+            | S::MovePlayerPos(_)
+            | S::MovePlayerPosRot(_)
+            | S::MovePlayerRot(_)
+            | S::MovePlayerStatus(_)
+            | S::PlayerLoaded(_)
+            | S::ChunkBatchReceived(_)
+            | S::Pong(_)
+            | S::KeepAlive(_)
+            | S::ClientTickEnd(_)
+            | S::PlayerInput(_)
+            | S::PlayerCommand(_)
+            | S::PlayerAction(_)
+            | S::Punch(_)
+            | S::Attack(_)
+            | S::Interact(_)
+            | S::UseItemOn(_)
+            | S::UseItem(_)
+            | S::SetCarriedItem(_)
+            | S::MoveVehicle(_)
+            | S::PaddleBoat(_)
+            | S::SetCreativeModeSlot(_)
+            | S::ContainerClick(_)
+            | S::ContainerClose(_)
+            | S::ContainerButtonClick(_)
+            | S::PickItemFromBlock(_)
+            | S::PickItemFromEntity(_)
+    )
+}
+
 pub struct Hub {
     packet_drain: Option<PacketDrain>,
     deferred_payloads: std::collections::HashMap<Option<u32>, DeferredPayload>,
@@ -458,6 +494,12 @@ pub struct Hub {
     clock_ids: Vec<i32>,
     item_ids: std::collections::HashMap<Arc<str>, i32>,
     entity_types: std::collections::HashMap<String, i32>,
+    /// The players whose region keeps them on its thread between ticks: their packets and leaves wait in
+    /// `away_events` for it (a resident region, `regions.rs`).
+    pub away: std::collections::HashSet<u32>,
+    away_events: Vec<(NetEvent, crate::net::ingress::ReceiveLease<NetEvent>)>,
+    /// Network events a landing gave back: the next poll handles them first.
+    replay: Vec<(NetEvent, crate::net::ingress::ReceiveLease<NetEvent>)>,
     /// Each level's tracked entities, by dimension.
     entities: std::collections::HashMap<String, Entities>,
     /// Each level's entities that joined it after its tracking pass, as they
@@ -911,6 +953,9 @@ impl Hub {
             clock_ids,
             item_ids: Default::default(),
             entity_types: Default::default(),
+            away: Default::default(),
+            away_events: Vec::new(),
+            replay: Vec::new(),
             entities: Default::default(),
             joined: Default::default(),
             fresh_joined: Default::default(),
@@ -2401,8 +2446,19 @@ impl Hub {
         self.finish_fake_kicks(&mut events);
         self.expire_arrivals(&mut events);
         let mut credits = Vec::new();
-        for receipt in self.lan.poll() {
-            let (event, credit) = receipt.into_parts();
+        let mut polled = std::mem::take(&mut self.replay);
+        polled.extend(self.lan.poll().into_iter().map(|receipt| receipt.into_parts()));
+        for (event, credit) in polled {
+            let for_away = match &event {
+                NetEvent::Packet(conn, ..) | NetEvent::Left(conn, _) => self.away.contains(conn),
+                NetEvent::RawPayload(delivery) => delivery.conn.is_some_and(|conn| self.away.contains(&conn)),
+                NetEvent::Duplicate(_) => !self.away.is_empty(),
+                NetEvent::Joined(_) => false,
+            };
+            if for_away {
+                self.away_events.push((event, credit));
+                continue;
+            }
             match event {
                 NetEvent::RawPayload(delivery) => {
                     self.poll_raw_payload(delivery, credit, &mut events, &mut credits);
@@ -2851,6 +2907,39 @@ impl Hub {
     /// the save's readers made them.
     fn update_chunks(&mut self, ctx: &TickCtx) {
         self.update_chunks_in(&*ctx.world, ctx.streaming);
+    }
+
+    /// Whether something an away player's connection sent has to be seen by the server's thread: a leave, a
+    /// duplicate login, or a packet that reaches past its region.
+    pub fn away_wants_server(&self) -> bool {
+        self.away_events.iter().any(|(event, _)| !matches!(event, NetEvent::Packet(_, p, _) if region_local(p)))
+    }
+
+    /// The packets held for `region`'s players put in their inboxes, in order, for its tick to handle.
+    pub fn give_away(&mut self, region: &mut Hub) {
+        if self.away_events.is_empty() {
+            return;
+        }
+        let mine: crate::fast_hash::FxHashSet<u32> = region.guests.iter().map(|g| g.conn).collect();
+        let (given, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.away_events)
+            .into_iter()
+            .partition(|(event, _)| matches!(event, NetEvent::Packet(conn, ..) if mine.contains(conn)));
+        self.away_events = kept;
+        for (event, credit) in given {
+            if let NetEvent::Packet(conn, packet, bytes) = event
+                && let Some(g) = region.guest_mut(conn)
+                && g.left_reason.is_empty()
+            {
+                g.sender.undrained.taken(bytes);
+                g.inbox.push_back(InboxItem::Packet(*packet, Some(credit)));
+            }
+        }
+    }
+
+    /// The players are back: what waited for them is for the next poll.
+    pub fn release_away(&mut self) {
+        self.away.clear();
+        self.replay.append(&mut self.away_events);
     }
 
     /// A region's players' chunks on its own thread, after its tick: a region owns every chunk its players see,
