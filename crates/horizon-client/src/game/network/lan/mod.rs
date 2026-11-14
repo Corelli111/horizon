@@ -2727,6 +2727,76 @@ impl Game<'_> {
     pub(super) fn spend_forced_meta(&mut self) {
         self.persist.forced_meta.clear();
     }
+
+    /// Run the hub for this tick and apply what the guests did. While the
+    /// single player game is `paused` only the connections run
+    /// (`IntegratedServer.tickPaused`): `ServerGamePacketListenerImpl.tick`
+    /// skips `tickPlayer`, so no player's air, hunger or damage moves on.
+    /// A region game's players' entities tracked on its own thread, from its own entities and its tracker (the
+    /// server's `tick_lan` steps for them): the server's hub then skips these players once.
+    pub(super) fn region_track(&mut self) {
+        let Some(host) = self.lan.as_mut() else {
+            return;
+        };
+        if host.hub.guests.is_empty() {
+            return;
+        }
+        let mut states = std::mem::take(&mut host.states);
+        let mut guests: Vec<_> = host.hub.guests.iter()
+            .filter_map(|g| Some((g.vehicle_order, g.vehicle?, g.entity_id)))
+            .collect();
+        guests.sort_by_key(|&(order, ..)| order);
+        let guests: Vec<_> = guests.into_iter().map(|(_, vehicle, id)| (vehicle, id)).collect();
+        let mut riding = std::mem::take(&mut host.hub.riding);
+        self.lan_assign_ids();
+        self.lan_riding(&guests, &mut riding);
+        self.lan_entities(&mut states, true, 0, None);
+        self.lan_hook_states(&mut states);
+        self.lan_entity_uuids(&mut states);
+        let mut host = self.lan.take().expect("region has a LAN host");
+        host.hub.riding = riding;
+        for m in &mut self.mobs {
+            m.needs_sync = false;
+            m.sync_position = false;
+        }
+        for p in &mut self.creatures.projectiles {
+            p.needs_sync = false;
+        }
+        self.tridents.iter_mut().for_each(|t| t.needs_sync = false);
+        self.dropped.iter_mut().for_each(|d| d.needs_sync = false);
+        let entities = states.as_slice();
+        let (gone, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.lan_entity_events)
+            .into_iter()
+            .partition(|(id, ..)| !entities.iter().any(|e| e.id == *id));
+        self.lan_entity_events = later;
+        for (id, event) in gone {
+            host.hub.entity_event(id, event);
+        }
+        let spawn = self.world_spawn_position();
+        let clock_rate = self.network_clock_rate();
+        let mut ctx = TickCtx {
+            sea_level: self.end.locator().map_or(63, |terrain| terrain.sea_level()),
+            world: &mut self.world,
+            entities,
+            next_entity: &mut self.next_entity,
+            spawn,
+            spawn_angle: self.level.world_spawn_angle,
+            spawn_dimension: self.level.spawn_dimension(),
+            difficulty: i32::from(self.ui.difficulty),
+            difficulty_locked: self.level.difficulty_locked,
+            clock_rate,
+            tick_rate: self.clock.rate(),
+            tick_frozen: self.clock.frozen(),
+            tick_steps: self.clock.step_state(),
+            collision: Some(self.collision),
+            border: &self.border,
+            streaming: None,
+        };
+        host.hub.region_track(&mut ctx);
+        host.states = states;
+        self.lan = Some(host);
+    }
+
     pub(super) fn tick_lan(&mut self, paused: bool) {
         // A frozen level does not reach tick_lan_packets through tick_world.
         // Apply its packets before taking the snapshot too.
