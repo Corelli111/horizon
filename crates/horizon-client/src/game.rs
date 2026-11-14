@@ -4395,6 +4395,7 @@ impl Game<'_> {
     /// What the tick runs after the local player's own update: effects, the
     /// world's entities and blocks, and the network hub.
     fn tick_world(&mut self, running: bool) -> Result<()> {
+        let began = Instant::now();
         // Entities added since the last tick join the level before it ticks.
         span("mods_joins_flush", || self.native_joins_flush(false, 0));
         span("share_spawn_conditions", || self.share_spawn_conditions());
@@ -4432,7 +4433,7 @@ impl Game<'_> {
         let mut regional = false;
         let mut after_regions = Instant::now();
         if running {
-            let started = Instant::now();
+            let started = self.regions.prof.add(region_profile::Step::Pre, began);
             horizon_client::spans::time("tick_lan_packets", || self.tick_lan_packets());
             self.regions.prof.add(region_profile::Step::Net, started);
             // With the parallel tick on, the level's blocks and entities tick by regions on threads of

@@ -1252,6 +1252,7 @@ impl Game<'_> {
                 Dim::End => "level_the_end",
                 Dim::Extra(_) => "level_extra",
             });
+            let entering = Instant::now();
             if let Err(e) = self.enter_level(dim) {
                 result = Err(e);
                 break;
@@ -1269,6 +1270,9 @@ impl Game<'_> {
                 self.update_dedicated_streaming();
             });
             horizon_client::spans::time("update_world", || self.update_world());
+            self.regions
+                .prof
+                .add(super::region_profile::Step::Stream, entering);
             let tick_span = horizon_client::spans::guard("level_tick");
             result = horizon_client::block_contact::in_level(
                 (self.serving.is_some() || self.options.dedicated.is_some()).then_some(dim.id()),
