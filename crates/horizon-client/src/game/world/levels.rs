@@ -1266,6 +1266,10 @@ impl Game<'_> {
             if observe_level && let Some(level) = self.level(dim.id()) {
                 self.native_level_tick_pre(level);
             }
+            // Resident regions start first: the streaming and the prelude below run while they tick.
+            if running == Some(true) && !paused {
+                horizon_client::spans::time("regions_launch", || self.launch_residents_early());
+            }
             horizon_client::spans::time("dedicated_streaming", || {
                 self.update_dedicated_streaming();
             });
@@ -1292,6 +1296,12 @@ impl Game<'_> {
             );
             drop(tick_span);
             self.drain_entity_inside();
+            // Regions started early whose level's world tick never waited for them.
+            if let Err(e) = self.finish_flight()
+                && result.is_ok()
+            {
+                result = Err(e);
+            }
             if result.is_err() {
                 break;
             }
