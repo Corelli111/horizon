@@ -47,7 +47,7 @@ fn repair(id: &str, chest: bool, table: &Enchantments) -> (u32, u32) {
                 .stage_world_tables(&packs, false, &resources)
                 .unwrap()
                 .0;
-            game.world_tables.as_mut().unwrap().stations.enchantments =
+            game.world_tables.as_mut().and_then(std::sync::Arc::get_mut).unwrap().stations.enchantments =
                 std::sync::Arc::new(table.clone());
             let mut stack = ItemStack::new(
                 if chest {
