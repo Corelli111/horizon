@@ -500,6 +500,11 @@ pub struct Hub {
     /// Where those players stand, to keep their chunks loaded.
     pub away_places: Vec<(i32, i32)>,
     away_events: Vec<(NetEvent, crate::net::ingress::ReceiveLease<NetEvent>)>,
+    /// The sleep counts (players not in spectator mode, in bed, asleep 100 ticks) the resident regions reported
+    /// last, summed: the server's night skip counts them with its own players. In a region's hub: its own report.
+    pub away_sleep: (i64, i64, i64),
+    /// The night was skipped: the region wakes its players on its next tick.
+    pub wake_request: bool,
     /// Network events a landing gave back: the next poll handles them first.
     replay: Vec<(NetEvent, crate::net::ingress::ReceiveLease<NetEvent>)>,
     /// Each level's tracked entities, by dimension.
@@ -957,6 +962,8 @@ impl Hub {
             entity_types: Default::default(),
             away: Default::default(),
             away_places: Vec::new(),
+            away_sleep: (0, 0, 0),
+            wake_request: false,
             away_events: Vec::new(),
             replay: Vec::new(),
             entities: Default::default(),
