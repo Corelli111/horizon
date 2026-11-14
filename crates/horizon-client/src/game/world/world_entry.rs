@@ -237,7 +237,7 @@ impl Game<'_> {
         reload: bool,
         root: &std::path::Path,
     ) -> Result<(
-        Option<WorldTables>,
+        Option<Arc<WorldTables>>,
         horizon_client::health::HealthResources,
         Option<mod_api::DatapackRegistrySet>,
     )> {
@@ -423,7 +423,7 @@ impl Game<'_> {
         drop(registries);
         conditions.check_errors()?;
         Ok((
-            Some(WorldTables {
+            Some(Arc::new(WorldTables {
                 conditions,
                 suffocation,
                 files,
@@ -433,7 +433,7 @@ impl Game<'_> {
                 reload_sources: reload.then_some(sources),
                 data_maps,
                 pack_tags,
-            }),
+            })),
             health,
             datapack_registries,
         ))
@@ -500,7 +500,7 @@ impl Game<'_> {
         // A new world load: a saved base clamped into its bounds warns again (arismoko/horizon#3728).
         horizon_client::living_attributes::LOAD_CLAMPS.begin_load();
         let (tables, health, registries) = self.stage_world_tables(stack, false, root)?;
-        self.world_tables = tables.map(Arc::new);
+        self.world_tables = tables;
         self.health_resources = health;
         self.mods.datapack_registries = registries.map(Arc::new);
         self.data_map_registries = self
@@ -559,7 +559,7 @@ impl Game<'_> {
         }
         self.mods.datapack_registries = datapack_registries.map(Arc::new);
         self.health_resources = health;
-        self.world_tables = tables.map(Arc::new);
+        self.world_tables = tables;
         self.data_map_registries = self
             .world_tables
             .as_ref()
