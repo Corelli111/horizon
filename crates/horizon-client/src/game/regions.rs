@@ -1361,6 +1361,8 @@ impl Game<'_> {
         if let Some(host) = host.as_mut() {
             host.hub.release_away_conns(&slot.conns);
             host.hub.restore_guest_order();
+            // Its sleepers are counted among the level's players now, not among those the region reported.
+            take_sleep(&mut host.hub.away_sleep, std::mem::take(&mut slot.sleep));
         }
         slot.game = Some(w);
         slot.landed = true;
@@ -1470,6 +1472,9 @@ impl Game<'_> {
             if let (Some(host), Some(shell)) = (host.as_mut(), w.lan.as_mut()) {
                 host.hub.park_tracker(&mut shell.hub);
                 host.take_region_back(shell);
+            }
+            if let Some(host) = host.as_mut() {
+                take_sleep(&mut host.hub.away_sleep, std::mem::take(&mut slot.sleep));
             }
             back.push(w);
         }
@@ -1707,6 +1712,13 @@ impl Game<'_> {
 }
 
 /// `v`'s items whose place a region owns, moved into that region's list; the rest stay.
+/// Takes a landed region's reported sleep counts out of the total the server's hub keeps for the regions away.
+fn take_sleep(total: &mut (i64, i64, i64), region: (i64, i64, i64)) {
+    total.0 = (total.0 - region.0).max(0);
+    total.1 = (total.1 - region.1).max(0);
+    total.2 = (total.2 - region.2).max(0);
+}
+
 fn split<T>(v: &mut Vec<T>, regions: &Regions, at: impl Fn(&T) -> (f64, f64)) -> Vec<Vec<T>> {
     let places: Vec<Option<usize>> = v
         .iter()
@@ -1974,6 +1986,15 @@ impl Game<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_landed_regions_sleepers_leave_the_away_count() {
+        let mut total = (5, 3, 2);
+        take_sleep(&mut total, (2, 1, 1));
+        assert_eq!(total, (3, 2, 1));
+        take_sleep(&mut total, (9, 9, 9));
+        assert_eq!(total, (0, 0, 0));
+    }
 
     #[test]
     fn players_far_apart_are_separate_regions() {
