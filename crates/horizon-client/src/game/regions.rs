@@ -1528,15 +1528,19 @@ impl Game<'_> {
         packet: horizon_protocol::packets::play::Clientbound,
         horizon_only: bool,
     ) -> bool {
-        let away = self.regions.resident.values().any(|set| {
-            set.games
-                .iter()
-                .any(|s| !s.landed && s.players.iter().any(|p| p.1 == uuid))
-        });
+        // Regions resting between ticks and regions started early this tick (in `flight`) alike.
+        let away = self
+            .regions
+            .resident
+            .values()
+            .chain(self.regions.flight.iter().map(|(_, f)| &f.set))
+            .any(|set| {
+                set.games
+                    .iter()
+                    .any(|s| !s.landed && s.players.iter().any(|p| p.1 == uuid))
+            });
         if away {
-            if self.regions.away_out.len() >= 4096 {
-                self.regions.away_out.remove(0);
-            }
+            // Never dropped: they wait for the region's next tick or for its landing.
             self.regions.away_out.push((uuid, packet, horizon_only));
         }
         away
