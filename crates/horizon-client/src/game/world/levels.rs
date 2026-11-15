@@ -1449,6 +1449,7 @@ impl Game<'_> {
             // long before this point; the lazy scoreboard/storage read has to
             // be done by then too, or a load tag writes over what it restores.
             self.load_scoreboard();
+            span("regions_land_functions", || self.land_residents_for_functions());
             span("tick_functions", || self.tick_functions());
             self.world.game_time += 1;
             if self

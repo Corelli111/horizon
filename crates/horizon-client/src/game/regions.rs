@@ -1553,6 +1553,19 @@ impl Game<'_> {
         .then(|| self.live_entity_ids().len() + lent)
     }
 
+    /// Brings every resident region home when this tick runs datapack functions (the `load` and `tick` tags, or a
+    /// scheduled one due): their commands (`execute as @a`) read the whole server's players and chunks, which
+    /// regions away would hide. The regions are lent again after the prelude.
+    pub(super) fn land_residents_for_functions(&mut self) {
+        if self.regions.worker
+            || (self.regions.resident.is_empty() && self.regions.flight.is_none())
+            || !self.functions_run_this_tick()
+        {
+            return;
+        }
+        self.land_residents();
+    }
+
     /// The resident regions of the level being ticked back, those just started early included.
     fn land_level_residents(&mut self) {
         let dim = self.dim;
