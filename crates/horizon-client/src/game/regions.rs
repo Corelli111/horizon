@@ -1642,10 +1642,10 @@ impl Game<'_> {
     /// The resident regions of the level being ticked back, those just started early included.
     fn land_level_residents(&mut self) {
         let dim = self.dim;
-        if self.regions.flight.as_ref().is_some_and(|f| f.0 == dim) {
-            if let Some((dim, flight)) = self.regions.flight.take() {
-                self.regions.resident.insert(dim, flight.set);
-            }
+        if self.regions.flight.as_ref().is_some_and(|f| f.0 == dim)
+            && let Some((dim, flight)) = self.regions.flight.take()
+        {
+            self.regions.resident.insert(dim, flight.set);
         }
         if let Some(set) = self.regions.resident.remove(&dim) {
             self.land_resident_set(set);
