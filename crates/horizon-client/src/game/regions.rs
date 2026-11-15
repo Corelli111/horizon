@@ -297,6 +297,9 @@ pub(super) struct RegionState {
     /// The regions just came home for nothing the server's thread has to do (their age, a player near the edge
     /// of its region): the level is split again in the same tick, instead of ticking whole on this thread.
     resplit: bool,
+    /// How many entities the level held (here and in resident regions) when the save began, before the regions
+    /// landed: [`Game::save_entities`] warns when it then writes none.
+    pub(super) entities_before_save: Option<usize>,
     /// What native mods sent to players who are away in a region (a clientbound packet, whether it is for a
     /// Horizon client only): delivered to the region's player before its next tick.
     pub(super) away_out: Vec<(u128, horizon_protocol::packets::play::Clientbound, bool)>,
@@ -1082,7 +1085,17 @@ impl Game<'_> {
             slot.running = Some(rx);
             slot.since = started;
             slot.told = None;
+            // A thread that cannot start leaves the game here: it holds the region's chunks and entities.
+            let cell = Arc::new(std::sync::Mutex::new(Some(w)));
+            let job = Arc::clone(&cell);
             let spawned = super::region_pool::run(move || {
+                let Some(mut w) = job
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                else {
+                    return;
+                };
                 let began = std::time::Instant::now();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     w.tick_region_phases().map_err(|e| e.to_string())
@@ -1092,6 +1105,10 @@ impl Game<'_> {
             });
             self.regions.prof.add(Step::Spawn, spawning);
             if !spawned {
+                slot.game = cell
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
                 slot.running = None;
                 failed.get_or_insert("a region thread could not start".to_owned());
             } else {
@@ -1494,9 +1511,38 @@ impl Game<'_> {
         });
     }
 
+    /// How many entities the level holds now, with those lent to resident regions that are home to be counted
+    /// (a region still ticking past its deadline is not).
+    pub(super) fn entities_with_residents(&self) -> Option<usize> {
+        let lent: usize = self
+            .regions
+            .resident
+            .values()
+            .chain(self.regions.flight.iter().map(|(_, f)| &f.set))
+            .flat_map(|set| set.games.iter())
+            .filter(|s| !s.landed)
+            .filter_map(|s| s.game.as_ref())
+            .map(|w| w.live_entity_ids().len())
+            .sum();
+        // Nothing is lent: nothing a save could miss.
+        (self
+            .regions
+            .resident
+            .values()
+            .any(|set| !set.games.is_empty())
+            || self.regions.flight.is_some())
+        .then(|| self.live_entity_ids().len() + lent)
+    }
+
     /// Every resident region of every level back (before a save or a stop).
     pub(super) fn land_residents(&mut self) {
         let home = self.dim;
+        // Regions started early this tick (`launch_residents_early`) are in `flight`, not resident: an autosave
+        // in the tick's prelude, a command's save or a stop found nothing to land and wrote the level without
+        // them. Landing waits for their threads.
+        if let Some((dim, flight)) = self.regions.flight.take() {
+            self.regions.resident.insert(dim, flight.set);
+        }
         let dims: Vec<Dim> = self.regions.resident.keys().copied().collect();
         for dim in dims {
             if dim != self.dim && self.enter_level(None, dim).is_err() {
