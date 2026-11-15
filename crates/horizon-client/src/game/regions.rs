@@ -269,6 +269,8 @@ impl Regions {
 /// before it takes more (no tick hands out anywhere near that many).
 const ID_BLOCK: u32 = 1 << 20;
 const ID_REFILL: u32 = 1 << 15;
+/// Ticks a level stays unsplit after one of its regions failed.
+const FAILED_PAUSE: u32 = 200;
 
 /// The most block changes one region lights in its tick; the rest wait for the next.
 const REGION_RELIGHT_PER_TICK: usize = 1024;
@@ -297,6 +299,8 @@ pub(super) struct RegionState {
     /// The regions just came home for nothing the server's thread has to do (their age, a player near the edge
     /// of its region): the level is split again in the same tick, instead of ticking whole on this thread.
     resplit: bool,
+    /// Ticks left before the level may be split again after a region failed.
+    paused: u32,
     /// How many entities the level held (here and in resident regions) when the save began, before the regions
     /// landed: [`Game::save_entities`] warns when it then writes none.
     pub(super) entities_before_save: Option<usize>,
@@ -835,6 +839,10 @@ impl Game<'_> {
             }
             entered = std::time::Instant::now();
         }
+        if self.regions.paused > 0 {
+            self.regions.paused -= 1;
+            return Ok(false);
+        }
         let Some(host) = self.lan.as_ref() else {
             return Ok(false);
         };
@@ -1013,6 +1021,10 @@ impl Game<'_> {
                         self.land_slot(&mut set, k);
                     }
                     self.regions.prof.add(Step::Land, landing);
+                    // The players that came home alone are not away for the request the launch clears.
+                    if self.lan.as_ref().is_some_and(|h| h.hub.wake_request) {
+                        self.wake_guests();
+                    }
                 }
                 None => {}
             }
@@ -1024,6 +1036,12 @@ impl Game<'_> {
                 .entity_pool
                 .get_or_insert_with(|| Arc::new(AtomicU32::new(self.next_entity + 1))),
         );
+        // The server's own game runs on past its block while the set stays out: it takes a new one from the pool
+        // whenever it runs low, as the region games do, so its ids never reach a region game's block.
+        if self.regions.entity_id_end == 0 {
+            self.regions.entity_id_end = self.next_entity;
+        }
+        self.refill_entity_ids(&pool);
         let started = std::time::Instant::now();
         // A region still ticking from an earlier tick is left to finish; the others start.
         let mut failed: Option<String> = None;
@@ -1131,6 +1149,15 @@ impl Game<'_> {
         for slot in set.games.iter_mut().filter(|s| !s.landed) {
             slot.age += 1;
         }
+        // A night skip's wake-up request went into every region that started; one set after this point (by the
+        // sleep tick that follows an early launch) stays for the next launch. A region still running keeps it
+        // for its next start too.
+        if failed.is_none()
+            && set.games.iter().enumerate().all(|(k, s)| s.landed || launched.contains(&k))
+            && let Some(host) = self.lan.as_mut()
+        {
+            host.hub.wake_request = false;
+        }
         Some(Flight {
             set,
             launched,
@@ -1233,7 +1260,6 @@ impl Game<'_> {
         }
         if let Some(host) = self.lan.as_mut() {
             host.hub.away_sleep = (a, s, d);
-            host.hub.wake_request = false;
         }
         // Native mods read the players away in a region from what it last reported.
         if self.lan.is_some() {
@@ -1259,10 +1285,17 @@ impl Game<'_> {
                 .collect();
         }
         if let Some(e) = failed {
+            // A region that panicked or could not start does not fail the server's tick: the regions come home,
+            // the level ticks on this thread, and splitting waits a while before it is tried again.
+            log::error!(
+                "a region of {} failed ({e}): the level ticks whole on the server thread for {FAILED_PAUSE} ticks",
+                self.dim.id()
+            );
             let landing = std::time::Instant::now();
             self.land_resident_set(set);
             self.regions.prof.add(Step::Land, landing);
-            return Err(e.into());
+            self.regions.paused = FAILED_PAUSE;
+            return Ok(None);
         }
         Ok(Some(set))
     }
@@ -1489,6 +1522,20 @@ impl Game<'_> {
             self.trim_entity_ids();
         }
         self.deliver_away_out_home();
+        self.wake_returned_guests();
+        // The regions of this level are home: /tps has no last ticks of them to show.
+        super::health::record_regions(self.dim.id(), Vec::new());
+    }
+
+    /// A night skip's wake-up request that no region took (it came after their start) wakes the players now home.
+    fn wake_returned_guests(&mut self) {
+        if self
+            .lan
+            .as_mut()
+            .is_some_and(|h| std::mem::take(&mut h.hub.wake_request))
+        {
+            self.wake_guests();
+        }
     }
 
     /// With every region home, the shared counter of entity ids goes back to just above the highest id any game
