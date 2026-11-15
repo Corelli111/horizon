@@ -1452,10 +1452,12 @@ impl Game<'_> {
         self.streaming.lent = None;
         let mut host = self.lan.take();
         let mut back = Vec::with_capacity(set.games.len());
+        let mut lost = false;
         for (mut slot, chunks) in set.games.into_iter().zip(set.chunks) {
             // One still ticking is waited for.
             let _ = slot.home(None);
             let Some(mut w) = slot.game.take() else {
+                lost = true;
                 continue;
             };
             if slot.landed {
@@ -1478,7 +1480,33 @@ impl Game<'_> {
         }
         self.lan = host;
         self.regions.idle.entry(dim).or_default().extend(back);
+        if !lost {
+            self.trim_entity_ids();
+        }
         self.deliver_away_out_home();
+    }
+
+    /// With every region home, the shared counter of entity ids goes back to just above the highest id any game
+    /// handed out, and every region game gives up its block (it takes a fresh one at its next lend): the counter
+    /// grows with the ids used, not by a block per game and cycle, and never wraps back onto ids in use.
+    fn trim_entity_ids(&mut self) {
+        if !self.regions.resident.is_empty() || self.regions.flight.is_some() {
+            return;
+        }
+        let Some(pool) = self.regions.entity_pool.clone() else {
+            return;
+        };
+        let mut high = self.next_entity;
+        for game in self.regions.idle.values().flatten() {
+            high = high.max(game.next_entity);
+        }
+        for game in self.regions.idle.values_mut().flatten() {
+            game.next_entity = 0;
+            game.regions.entity_id_end = 0;
+        }
+        pool.store(high.saturating_add(1), Ordering::Relaxed);
+        // The server's own block ends where it stands: its next refill takes a block from the pool again.
+        self.regions.entity_id_end = self.next_entity;
     }
 
     /// The players native mods can see: those away in a resident region, as it last reported them.
