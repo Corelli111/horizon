@@ -476,6 +476,13 @@ impl World {
         } = region;
         // Each region counted its own writes from the same start: the total keeps the count going up.
         self.revision = self.revision.max(revision);
+        // The region's maps replace the server's copies for its chunks: a chest closed or a container name
+        // dropped by the region's ticks must not stay on the server (an "open" chest forever, a name that passes
+        // to the next block placed there).
+        let lent: FxHashSet<(i32, i32)> = chunks.keys().copied().collect();
+        let in_region = |p: &(i32, i32, i32)| lent.contains(&(p.0 >> 4, p.2 >> 4));
+        self.chest_openers.retain(|p, _| !in_region(p));
+        self.block_names.retain(|p, _| !in_region(p));
         self.chunks.take_back(chunks);
         self.block_entities.take_back(block_entities);
         for ((x, z), mask) in dirty_sections.columns() {
@@ -1184,5 +1191,24 @@ mod region_tests {
         assert!(world.dirty_light.contains(&(3, 0)));
         assert_eq!(world.revision, 1);
         assert_eq!(world.chest_openers.len(), 2);
+    }
+
+    /// A chest the region closed, and a name it dropped, are gone from the world when it comes back.
+    #[test]
+    fn a_closed_chest_and_a_dropped_name_do_not_come_back() {
+        let mut world = World::new(BlockStateId(0), 1);
+        world.chunks.insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+        world.chunks.insert((5, 0), Arc::new(Chunk::empty(0, 0)));
+        world.chest_openers.insert((1, 64, 1), (2, 3.0));
+        world.block_names.insert((2, 64, 2), horizon_world::nbt::Tag::String("old".into()));
+        // Another chunk, not lent: stays.
+        world.chest_openers.insert((81, 64, 1), (1, 4.0));
+        let mut parts = world.lend(1, |(x, _)| (x == 0).then_some(0), &[5]);
+        parts[0].chest_openers.clear();
+        parts[0].block_names.clear();
+        world.take_back(parts.remove(0));
+        assert_eq!(world.chest_openers.len(), 1);
+        assert!(world.chest_openers.contains_key(&(81, 64, 1)));
+        assert!(world.block_names.is_empty());
     }
 }
