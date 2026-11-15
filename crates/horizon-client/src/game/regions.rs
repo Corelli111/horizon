@@ -1594,6 +1594,12 @@ impl Game<'_> {
         self.tick_block_entities()?;
         // Its players' turn: their own ticks, entities, chunks and block changes, from its own world.
         self.tick_lan(false);
+        // Primed TNT and falling blocks that joined since the spawn packets (the early pass leaves them
+        // out until `announced` passes them), then everything joined counts as announced, as the server's
+        // tick does (#10063).
+        self.run_ordered_ticks(horizon_client::join_seq::JoinSeq::MAX, true)?;
+        self.apply_late_wind_pushes();
+        self.ordered.announced = horizon_client::join_seq::JoinSeq::upcoming();
         // Sculk in its own chunks: the vibrations its players and mobs make, and the sensors, shriekers and
         // catalysts that answer them.
         self.tick_sculk_entities();
