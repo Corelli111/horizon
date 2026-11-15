@@ -593,9 +593,6 @@ impl Game<'_> {
 
     // ---- ticking -----------------------------------------------------------------
 
-    /// `ServerFunctionManager.tick`: the `#minecraft:load` functions after a
-    /// reload, then the `#minecraft:tick` ones, before the levels tick (and
-    /// before the game time moves on).
     /// Whether the tick's prelude runs functions that may reach any chunk or player: the `load` tag still to run,
     /// the `tick` tag's, or a scheduled one due once the clock has moved on. Resident regions are not started
     /// before them: they would find lent chunks unavailable and their players absent.
@@ -609,6 +606,9 @@ impl Game<'_> {
                 .iter()
                 .any(|e| e.time <= self.world.game_time + 1)
     }
+    /// `ServerFunctionManager.tick`: the `#minecraft:load` functions after a
+    /// reload, then the `#minecraft:tick` ones, before the levels tick (and
+    /// before the game time moves on).
     pub(super) fn tick_functions(&mut self) {
         if self.remote.is_some() {
             return;

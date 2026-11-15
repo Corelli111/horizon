@@ -6,9 +6,14 @@
 //! touches. A region owns its sections and a ring of one section around each ticking one, so two regions' chunks
 //! never meet and a region's ticks find the chunks next to theirs.
 //!
-//! This module only decides which region owns what. It is pure data: no game state, no threads.
-// Nothing calls it until the region threads come in the next commits.
-#![allow(dead_code)]
+//! [`Regions`] decides which region owns what. The rest of the module ticks them (`[regions]`, off by default):
+//! a level with players in two or more separate areas is split, and each region's chunks, entities, block
+//! entities and players are lent to a pooled region game (`region_pool.rs`) that ticks them on a thread of its
+//! own, its players' packets included. A set of regions stays resident between ticks and lands (every part comes
+//! home to the server's game) every few periods, or when the server's thread has something to do with a player
+//! or a chunk of theirs (a command, a join or leave, a death, a native mod's hook); one region may come home alone.
+//! The server's thread waits for them to the region deadline, runs the serial phases on what it still holds,
+//! and sums what they report (the night skip's sleep counts, `/tps`' numbers).
 use super::region_profile::Step;
 use super::{Dim, Game, Mob, Resources};
 use horizon_client::Result;
@@ -36,8 +41,6 @@ pub(super) struct Regions {
     owned: FxHashMap<(i32, i32), usize>,
     /// How many regions the level has.
     pub count: usize,
-    /// Each region's first section (its smallest): what names a region from one tick to the next.
-    pub firsts: Vec<(i32, i32)>,
     /// `owned` as a flat table over the sections' bounds, when that is small enough: every split of the level asks
     /// for each chunk's and entity's region (tens of thousands a tick), one array read each.
     grid: Option<Grid>,
@@ -136,12 +139,10 @@ impl Regions {
         keys.sort_unstable();
         let mut region: FxHashMap<(i32, i32), usize> = FxHashMap::default();
         let mut count = 0;
-        let mut firsts = Vec::new();
         for start in keys {
             if region.contains_key(&start) {
                 continue;
             }
-            firsts.push(start);
             region.insert(start, count);
             let mut stack = vec![start];
             while let Some((x, z)) = stack.pop() {
@@ -189,12 +190,6 @@ impl Regions {
                 for r in region.values_mut() {
                     *r = renumber[*r];
                 }
-                firsts = firsts
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(r, _)| has_player[*r])
-                    .map(|(_, f)| f)
-                    .collect();
                 count = kept;
             }
         }
@@ -215,7 +210,6 @@ impl Regions {
         Self {
             owned,
             count,
-            firsts,
             grid,
             only: std::sync::atomic::AtomicUsize::new(usize::MAX),
         }
@@ -537,20 +531,6 @@ impl Game<'_> {
         }
     }
 
-    /// A game for a region's thread: the same resources, options and world settings as this one, and no level,
-    /// players or connections of its own (a region's are lent in for its tick).
-    pub(super) fn region_worker(&mut self) -> Result<Game<'static>> {
-        let options = self.options.clone();
-        let res = self.static_resources();
-        let mut w =
-            super::integrated::server_game(res, self.pack.clone(), options, self.settings.clone())?;
-        w.copy_world_settings_from(self);
-        w.regions.worker = true;
-        // No ids of its own: the first tick draws a block from the server's counter (`refill_entity_ids`).
-        w.next_entity = 0;
-        w.regions.entity_id_end = 0;
-        Ok(w)
-    }
 
     /// What every region game shares with the server's: the world's settings and tables, as they are now
     /// (copied again when they change: `/gamerule`, `/difficulty`, `/reload`).
@@ -2095,7 +2075,8 @@ mod tests {
         let r = Regions::new([], &players, 8);
         assert_eq!(r.count, 1);
         let again = Regions::new([], &players, 8);
-        assert_eq!(r.firsts, again.firsts);
+        assert_eq!(again.count, 1);
+        assert_eq!(again.of_block(-3.5, 0.0), r.of_block(-3.5, 0.0));
         assert_eq!(r.of_block(-3.5, 0.0), r.of_block(0.0, 0.0));
     }
 
