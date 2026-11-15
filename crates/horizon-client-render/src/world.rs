@@ -87,6 +87,9 @@ pub struct World {
     pub chunks: crate::chunk_map::ChunkMap,
     pub random: LevelRandom,
     pub revision: u64,
+    /// For a region's world: the level's `revision` when it was lent, so that what the region wrote adds to the
+    /// level's count on its way back instead of hiding behind another region's.
+    pub lent_revision: u64,
     pub health_rules: HealthRules,
     pub air: BlockStateId,
     /// Sections whose geometry changed and need remeshing.
@@ -312,6 +315,7 @@ impl World {
             chunks: Default::default(),
             random: LevelRandom::for_level(LegacyRandom::new(seed)),
             revision: 0,
+            lent_revision: 0,
             health_rules: HealthRules::default(),
             air,
             fast_lava: false,
@@ -382,6 +386,7 @@ impl World {
                 w.random = LevelRandom::for_level(LegacyRandom::new(
                     seeds.get(r).copied().unwrap_or(r as i64),
                 ));
+                w.lent_revision = self.revision;
                 w.chunks = chunks;
                 w.block_entities = std::mem::take(&mut entities[r]);
                 w.inhabited = std::mem::take(&mut inhabited[r]);
@@ -457,6 +462,7 @@ impl World {
         let World {
             chunks,
             revision,
+            lent_revision,
             dirty_sections,
             dirty_light,
             light_edits,
@@ -474,8 +480,11 @@ impl World {
             attachment_syncs,
             ..
         } = region;
-        // Each region counted its own writes from the same start: the total keeps the count going up.
-        self.revision = self.revision.max(revision);
+        // Each region counted its own writes from the same start: the total adds them, so no region's writes hide
+        // behind another's (a cache keyed on the count sees every landing that changed something).
+        let wrote = revision.wrapping_sub(lent_revision);
+        let changed = wrote > 0 || !modified.is_empty() || !dirty_light.is_empty();
+        self.revision = self.revision.wrapping_add(if changed { wrote.max(1) } else { 0 });
         // The region's maps replace the server's copies for its chunks: a chest closed or a container name
         // dropped by the region's ticks must not stay on the server (an "open" chest forever, a name that passes
         // to the next block placed there).
@@ -1182,6 +1191,8 @@ mod region_tests {
         parts[1].modified.insert((3, 0));
         parts[1].dirty_light.insert((3, 0));
         parts[1].revision += 1;
+        // Region 0 wrote one block too: both count.
+        parts[0].revision += 1;
         for part in parts {
             world.take_back(part);
         }
@@ -1189,7 +1200,7 @@ mod region_tests {
         assert_eq!(world.inhabited[&(3, 0)], 13);
         assert!(world.modified.contains(&(3, 0)));
         assert!(world.dirty_light.contains(&(3, 0)));
-        assert_eq!(world.revision, 1);
+        assert_eq!(world.revision, 2);
         assert_eq!(world.chest_openers.len(), 2);
     }
 
