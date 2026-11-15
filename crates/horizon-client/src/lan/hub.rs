@@ -875,7 +875,9 @@ impl Hub {
                     if g.placed && !g.fake && !self.lan.shared.roster_has(g.conn) {
                         self.publish_guest(&g);
                     }
-                    self.lan.shared.roster_lend_scoreboard(g.conn, g.scoreboard.clone());
+                    self.lan
+                        .shared
+                        .roster_lend_scoreboard(g.conn, g.scoreboard.clone());
                     out[r].push(g)
                 }
                 _ => kept.push(g),
@@ -900,11 +902,15 @@ impl Hub {
             }
         }
         self.guests.append(&mut region.guests);
-        self.native_menu_events.append(&mut region.native_menu_events);
-        self.native_menu_returns.append(&mut region.native_menu_returns);
+        self.native_menu_events
+            .append(&mut region.native_menu_events);
+        self.native_menu_returns
+            .append(&mut region.native_menu_returns);
         self.native_tracking.append(&mut region.native_tracking);
-        self.attachment_snapshots.append(&mut region.attachment_snapshots);
-        self.native_advancement_grants.append(&mut region.native_advancement_grants);
+        self.attachment_snapshots
+            .append(&mut region.attachment_snapshots);
+        self.native_advancement_grants
+            .append(&mut region.native_advancement_grants);
         for (k, v) in region.item_ids.drain() {
             self.item_ids.entry(k).or_insert(v);
         }
@@ -1092,11 +1098,17 @@ impl Hub {
     }
     /// Sends the scoreboard changes to the players in other hubs (resident regions).
     pub fn sync_scoreboard_others(&self, view: &super::scoreboard::View) {
-        self.lan.shared.roster_sync_scoreboard(|c| self.guest(c).is_some(), view);
+        self.lan
+            .shared
+            .roster_sync_scoreboard(|c| self.guest(c).is_some(), view);
     }
     /// Whether players are in other hubs.
     pub fn has_roster_others(&self) -> bool {
-        !self.lan.shared.roster_others(|c| self.guest(c).is_some()).is_empty()
+        !self
+            .lan
+            .shared
+            .roster_others(|c| self.guest(c).is_some())
+            .is_empty()
     }
     /// Puts this hub's placed players in the shared roster (or refreshes their entries).
     pub fn publish_roster(&self) {
@@ -2732,7 +2744,10 @@ impl Hub {
     pub fn end_tick(&mut self) {
         // Players placed since the roster last saw them, and every 601 ticks all, with their current entries.
         if self.ticks.is_multiple_of(601)
-            || self.guests.iter().any(|g| g.placed && !g.fake && !self.lan.shared.roster_has(g.conn))
+            || self
+                .guests
+                .iter()
+                .any(|g| g.placed && !g.fake && !self.lan.shared.roster_has(g.conn))
         {
             self.publish_roster();
         }
@@ -3657,8 +3672,15 @@ impl Hub {
 
     /// All entities as one client sees them: the world's and the other players.
     /// The level's entity states for the region trackers, by the chunk each was last seen in.
-    pub fn lend_trackers(&mut self, regions: usize, region_of: impl Fn((i32, i32)) -> Option<usize>) -> Vec<Entities> {
-        self.entities.entry(self.config.dimension.clone()).or_default().lend(regions, region_of)
+    pub fn lend_trackers(
+        &mut self,
+        regions: usize,
+        region_of: impl Fn((i32, i32)) -> Option<usize>,
+    ) -> Vec<Entities> {
+        self.entities
+            .entry(self.config.dimension.clone())
+            .or_default()
+            .lend(regions, region_of)
     }
 
     /// A region tracker for this (region) hub's level.
@@ -3669,7 +3691,10 @@ impl Hub {
     /// A region hub's tracker back in this (the server's) hub's, parked.
     pub fn park_tracker(&mut self, region: &mut Hub) {
         if let Some(t) = region.entities.remove(&region.config.dimension) {
-            self.entities.entry(self.config.dimension.clone()).or_default().park(t);
+            self.entities
+                .entry(self.config.dimension.clone())
+                .or_default()
+                .park(t);
         }
     }
 
