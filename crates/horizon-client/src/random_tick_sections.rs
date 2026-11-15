@@ -55,11 +55,14 @@ struct Cached {
     read: Vec<Weak<Section>>,
     sections: Sections,
     /// Each ticking section's [`RandomTickMask`], built at its first draw
-    /// and dropped when the section is read again. `Arc`, not `Rc`: the cache
-    /// moves with its level to a region's thread. (It was an `Rc` because the
-    /// atomic count on a mask out of cache stalled the random tick loop: measure
-    /// the loop before and after this change.)
-    masks: Vec<Option<Arc<RandomTickMask>>>,
+    /// and dropped when the section is read again. Owned, never shared by a
+    /// reference count: the tick thread takes a mask per ticking section per
+    /// tick, and an atomic count on a mask out of cache stalled the whole random
+    /// tick loop, while an `Rc` cannot move with the level to a region's thread.
+    /// [`RandomTickSections::next_masked`] hands out a plain copy (512 bytes read
+    /// in a row, which the loop's draws would touch anyway), so nothing in the
+    /// loop counts references.
+    masks: Vec<Option<Box<RandomTickMask>>>,
 }
 /// Vanilla keeps a count of randomly ticking blocks and fluids per section,
 /// updated by every `setBlockState`, and ticks the sections where it is above
@@ -124,16 +127,16 @@ impl RandomTickSections {
         facts: &BlockFacts,
         mut candidate: impl FnMut(u32) -> bool,
         from_y: i32,
-    ) -> Option<(i32, Arc<RandomTickMask>)> {
+    ) -> Option<(i32, RandomTickMask)> {
         let cached = Self::refresh(&mut self.chunks, key, chunk, &mut |id| {
             facts.get(BlockStateId(id)).random_ticks
         });
         let y = cached.sections.from(from_y)?;
         let index = ((y - cached.sections.base) >> 4) as usize;
         let mask = cached.masks[index].get_or_insert_with(|| {
-            Arc::new(Self::candidate_mask(&chunk.sections[index], &mut candidate))
+            Box::new(Self::candidate_mask(&chunk.sections[index], &mut candidate))
         });
-        Some((y, mask.clone()))
+        Some((y, (**mask).clone()))
     }
     /// Builds, on the tick's helper threads (`crate::parallel`), the masks [`Self::next_masked`]
     /// will build at the first draw in each ticking section of the chunks `keys` names, from their
@@ -169,7 +172,7 @@ impl RandomTickSections {
         });
         for ((key, i, _), mask) in todo.into_iter().zip(masks) {
             if let Some(cached) = self.chunks.get_mut(&key) {
-                cached.masks[i] = Some(Arc::new(mask));
+                cached.masks[i] = Some(Box::new(mask));
             }
         }
     }

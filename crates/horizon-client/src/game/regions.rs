@@ -1153,7 +1153,11 @@ impl Game<'_> {
         // sleep tick that follows an early launch) stays for the next launch. A region still running keeps it
         // for its next start too.
         if failed.is_none()
-            && set.games.iter().enumerate().all(|(k, s)| s.landed || launched.contains(&k))
+            && set
+                .games
+                .iter()
+                .enumerate()
+                .all(|(k, s)| s.landed || launched.contains(&k))
             && let Some(host) = self.lan.as_mut()
         {
             host.hub.wake_request = false;
