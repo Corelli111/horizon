@@ -814,43 +814,43 @@ impl Game<'_> {
     /// region game that keeps them (a resident region) and ticks them on a thread of its own, its players' packets
     /// and network turn included. They come back every `resident_period` ticks, or when something needs the
     /// server's thread (a chat line or command, a join or leave, a death, a player leaving its region).
-    /// Returns `false`: what no region owns, and the whole level in a tick the regions are back, ticks in the
-    /// serial phases on this thread.
-    pub(super) fn tick_world_regions(&mut self) -> Result<bool> {
+    /// The serial phases that follow always run, on what this thread still holds: what no region owns, and the
+    /// whole level in a tick the regions are back.
+    pub(super) fn tick_world_regions(&mut self) -> Result<()> {
         // The End is one region while its dragon fight runs: the fight belongs to the server's thread.
         let fighting = self.dim == Dim::End && !(self.fight.killed || self.fight.previously_killed);
         if self.regions.worker {
-            return Ok(false);
+            return Ok(());
         }
         if !region_threads_on() || fighting {
             // The parallel tick went off, or the End's fight began, with regions out: they come back, or their
             // chunks, entities and players stay frozen away from the server.
             self.land_level_residents();
-            return Ok(false);
+            return Ok(());
         }
         let dim = self.dim;
         let mut entered = std::time::Instant::now();
         if self.regions.flight.as_ref().is_some_and(|f| f.0 == dim) {
             self.finish_flight()?;
-            return Ok(false);
+            return Ok(());
         }
         if let Some(set) = self.regions.resident.remove(&dim) {
             self.regions.prof.note_resident();
             if let Some(set) = self.resident_tick(set, false)? {
                 self.regions.resident.insert(dim, set);
-                return Ok(false);
+                return Ok(());
             }
             if !std::mem::take(&mut self.regions.resplit) {
-                return Ok(false);
+                return Ok(());
             }
             entered = std::time::Instant::now();
         }
         if self.regions.paused > 0 {
             self.regions.paused -= 1;
-            return Ok(false);
+            return Ok(());
         }
         let Some(host) = self.lan.as_ref() else {
-            return Ok(false);
+            return Ok(());
         };
         let view = host.hub.config.view_distance.clamp(2, 32);
         let players: Vec<(i32, i32)> = host
@@ -866,7 +866,7 @@ impl Game<'_> {
             })
             .collect();
         if players.len() < 2 {
-            return Ok(false);
+            return Ok(());
         }
         let levels = self.tickets.levels();
         let ticking = self
@@ -879,7 +879,7 @@ impl Game<'_> {
         // never counts as having left its region.
         let regions = Regions::new(ticking, &players, view + 1);
         if regions.count < 2 {
-            return Ok(false);
+            return Ok(());
         }
         static LAST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         if LAST.swap(regions.count, Ordering::Relaxed) != regions.count {
@@ -899,7 +899,7 @@ impl Game<'_> {
             if wanted > 0 {
                 self.request_region_games(wanted);
             }
-            return Ok(false);
+            return Ok(());
         }
         let mut games = self.regions.idle.remove(&dim).unwrap_or_default();
         let extra: Vec<Box<Game<'static>>> = games.split_off(regions.count);
@@ -983,7 +983,7 @@ impl Game<'_> {
         if let Some(set) = self.resident_tick(set, true)? {
             self.regions.resident.insert(dim, set);
         }
-        Ok(false)
+        Ok(())
     }
 
     /// One tick of the resident regions `set`, on threads of their own; `None` once they are back (the tick ran
