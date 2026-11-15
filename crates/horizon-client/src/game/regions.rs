@@ -1342,7 +1342,8 @@ impl Game<'_> {
             return;
         };
         let mut host = self.lan.take();
-        self.take_region_back(&mut w, &set.chunks[k]);
+        let drawn = self.take_region_back(&mut w, &set.chunks[k]);
+        self.rand_sequences.absorb(drawn);
         if let (Some(host), Some(shell)) = (host.as_mut(), w.lan.as_mut()) {
             host.hub.park_tracker(&mut shell.hub);
             host.take_region_back(shell);
@@ -1452,7 +1453,8 @@ impl Game<'_> {
                 back.push(w);
                 continue;
             }
-            self.take_region_back(&mut w, &chunks);
+            let drawn = self.take_region_back(&mut w, &chunks);
+            self.rand_sequences.absorb(drawn);
             if let (Some(host), Some(shell)) = (host.as_mut(), w.lan.as_mut()) {
                 host.hub.park_tracker(&mut shell.hub);
                 host.take_region_back(shell);

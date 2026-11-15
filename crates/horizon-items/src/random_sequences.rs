@@ -93,6 +93,9 @@ impl RandomSequences {
             .map(|r| {
                 let mut copy = self.clone();
                 if r > 0 {
+                    // Its own flag: set when the region draws, for [`RandomSequences::absorb`].
+                    copy.dirty = false;
+                    copy.watched = None;
                     let k = (r as u64).wrapping_mul(GOLDEN_RATIO);
                     copy.salt ^= k as i32;
                     for random in copy.sequences.values_mut() {
@@ -115,6 +118,19 @@ impl RandomSequences {
             self.dirty |= sequences != self.sequences;
             self.sequences = sequences;
         }
+    }
+    /// A region from [`RandomSequences::split`] that stays out for many ticks and comes home alone: when it drew,
+    /// its streams (the new ones too) become these, so the draws carry on where it left them and a later split
+    /// does not repeat them. A region that did not draw leaves these as they are. With several regions on one
+    /// level, the last one home wins an id they all drew from; each stream is a valid, separate one.
+    pub fn absorb(&mut self, mut region: Self) {
+        region.settle();
+        if !region.dirty {
+            return;
+        }
+        self.settle();
+        self.sequences.extend(region.sequences);
+        self.dirty = true;
     }
     /// Lends sequence `id` out (created if missing); `give_back` returns it. Lending
     /// is no draw; what was drawn from it marks the data when it comes back.
@@ -229,6 +245,33 @@ impl RandomSequences {
 mod tests {
     use super::*;
     use horizon_core::random::RandomSource;
+
+    /// A resident region's draws are the level's once it lands: the next split carries on after them, and the
+    /// save has them; a region that drew nothing changes nothing.
+    #[test]
+    fn a_landed_region_leaves_its_draws_with_the_level() {
+        let mut level = RandomSequences::default();
+        level.get("minecraft:x", 42).next_int_bound(10).unwrap();
+        assert!(level.take_dirty_nbt().is_some());
+        let mut parts = level.split(3);
+        parts.remove(0);
+        let before = level.clone();
+        // Region 1 draws (and makes a stream of its own); region 2 does not.
+        let drawn = parts[0].get("minecraft:y", 42).next_int_bound(1_000_000).unwrap();
+        parts[0].get("minecraft:x", 42).next_int_bound(1_000_000).unwrap();
+        let mut resumed = parts[0].clone();
+        let idle = parts.remove(1);
+        level.absorb(idle);
+        assert_eq!(level.sequences, before.sequences);
+        assert!(level.take_dirty_nbt().is_none());
+        level.absorb(parts.remove(0));
+        assert!(level.take_dirty_nbt().is_some());
+        let next = level.get("minecraft:x", 42).next_int_bound(1_000_000).unwrap();
+        let expected = resumed.get("minecraft:x", 42).next_int_bound(1_000_000).unwrap();
+        assert_eq!(next, expected);
+        assert!(level.ids().contains(&"minecraft:y".to_owned()));
+        let _ = drawn;
+    }
 
     /// The first region carries on the sequences' own draws; the others draw differently from each other.
     #[test]
