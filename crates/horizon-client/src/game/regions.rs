@@ -563,6 +563,7 @@ impl Game<'_> {
         self.world_tables = from.world_tables.clone();
         self.share_spawn_conditions();
         self.copy_tick_settings_from(from);
+        self.lend_scoreboard_from(from);
     }
 
     /// What can change from tick to tick that a region reads but never writes: the rules, the difficulty, the
@@ -698,6 +699,7 @@ impl Game<'_> {
         w: &mut Game<'_>,
         chunks: &[ChunkPos],
     ) -> horizon_client::random_sequences::RandomSequences {
+        self.merge_region_scores(w);
         let stand_in = self.world.stand_in();
         let region_world = std::mem::replace(&mut w.world, stand_in);
         let region_ticks = std::mem::take(&mut w.block_ticks);
