@@ -1134,8 +1134,6 @@ fn only_a_dedicated_server_has_the_dedicated_commands() {
         "setidletimeout",
         "stop",
         "transfer",
-        "tps",
-        "mspt",
         "whitelist",
     ];
     for dev in [false, true] {
@@ -1152,9 +1150,14 @@ fn only_a_dedicated_server_has_the_dedicated_commands() {
                 assert!(integrated.find(name).is_some(), "{name}");
                 assert!(server.find(name).is_none(), "{name}");
             }
+            // Horizon's own `/tps` and `/mspt` are the dedicated server's with Horizon's commands on, never vanilla's.
+            for name in ["tps", "mspt"] {
+                assert!(integrated.find(name).is_none(), "{name}");
+                assert_eq!(server.find(name).is_some(), horizon, "{name}");
+            }
             assert_eq!(
                 server.nodes[0].children.len(),
-                integrated.nodes[0].children.len() + dedicated.len() - 2
+                integrated.nodes[0].children.len() + dedicated.len() - 2 + 2 * usize::from(horizon)
             );
         }
     }

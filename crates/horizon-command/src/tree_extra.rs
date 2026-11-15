@@ -213,13 +213,6 @@ pub fn register(d: &mut Dispatcher, root: usize) {
 /// (`Commands.CommandSelection.includeDedicated`): an integrated server, and
 /// so single player and a LAN world, has none of them.
 pub fn register_dedicated(d: &mut Dispatcher, root: usize) {
-    // The server's health: TPS and tick times, and each region's.
-    for name in ["tps", "mspt"] {
-        let n = d.literal(root, name);
-        d.requires(n, GAMEMASTERS);
-        d.executes(n, name);
-    }
-
     // BanIpCommands, BanListCommands
     let ban_ip = d.literal(root, "ban-ip");
     d.requires(ban_ip, ADMINS);
@@ -318,4 +311,15 @@ pub fn register_dedicated(d: &mut Dispatcher, root: usize) {
     }
     let reload = d.literal(whitelist, "reload");
     d.executes(reload, "whitelist.reload");
+}
+
+/// Horizon's own commands of a dedicated server, with Horizon's commands on (`set_horizon_commands`): the
+/// server's health, `/tps` (TPS, tick times and each region's last tick) and `/mspt`. Vanilla has neither, so
+/// they are no part of [`register_dedicated`].
+pub fn register_horizon_dedicated(d: &mut Dispatcher, root: usize) {
+    for name in ["tps", "mspt"] {
+        let n = d.literal(root, name);
+        d.requires(n, GAMEMASTERS);
+        d.executes(n, name);
+    }
 }

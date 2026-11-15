@@ -612,7 +612,7 @@ pub fn session_dispatcher(registry: &RuleRegistry, features: &[String]) -> Dispa
         registry,
     );
     if horizon {
-        horizon_commands(&mut tree, 0);
+        horizon_commands(&mut tree, 0, dedicated);
     }
     // Game-session tooling, not part of vanilla's reference/parity dispatcher.
     let profile = tree.literal(0, "modprofile");
@@ -655,15 +655,18 @@ pub(crate) fn game_tree(dev: bool, horizon: bool, dedicated: bool) -> &'static D
             .get_or_init(|| {
                 let mut d = build_for(dev, dedicated);
                 if horizon {
-                    horizon_commands(&mut d, 0);
+                    horizon_commands(&mut d, 0, dedicated);
                 }
                 d
             }),
     }
 }
 /// Commands vanilla doesn't have, after its own: `/pregen`
-/// (docs/pregeneration.md).
-fn horizon_commands(d: &mut Dispatcher, root: usize) {
+/// (docs/pregeneration.md), and on a dedicated server `/tps` and `/mspt`.
+fn horizon_commands(d: &mut Dispatcher, root: usize, dedicated: bool) {
+    if dedicated {
+        super::tree_extra::register_horizon_dedicated(d, root);
+    }
     let pregen = d.literal(root, "pregen");
     d.requires(pregen, GAMEMASTERS);
     let start = d.literal(pregen, "start");

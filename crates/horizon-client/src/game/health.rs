@@ -14,6 +14,13 @@ struct Ticks {
     ticks: VecDeque<(Instant, f32)>,
 }
 
+/// A translatable message with plain arguments. Vanilla clients lack Horizon's keys, so it carries its English
+/// text as the fallback (`chat_filter::Reply::translation`).
+fn tr(key: &str, args: &[&dyn std::fmt::Display]) -> Text {
+    let args: Vec<Text> = args.iter().map(|a| Text::literal(a.to_string())).collect();
+    super::chat_filter::Reply::translation(key, &args)
+}
+
 static TICKS: Mutex<Ticks> = Mutex::new(Ticks {
     ticks: VecDeque::new(),
 });
@@ -99,11 +106,11 @@ impl Game<'_> {
             let t = lock(&TICKS);
             let mut lines = Vec::new();
             let windows = [
-                ("5s", 5u64),
-                ("15s", 15),
-                ("1m", 60),
-                ("5m", 300),
-                ("15m", 900),
+                (Span::Seconds(5), 5u64),
+                (Span::Seconds(15), 15),
+                (Span::Minutes(1), 60),
+                (Span::Minutes(5), 300),
+                (Span::Minutes(15), 900),
             ];
             let stats: Vec<_> = windows
                 .iter()
@@ -117,18 +124,19 @@ impl Game<'_> {
                 .iter()
                 .map(|s| s.map_or("-".into(), |s| format!("{:.1}", s.1)))
                 .collect();
-            let names: Vec<&str> = windows.iter().map(|w| w.0).collect();
-            lines.push(format!(
-                "Server health: TPS ({}): {}",
-                names.join(", "),
-                tps.join(", ")
+            let names: Vec<String> = windows.iter().map(|w| w.0.label()).collect();
+            lines.push(tr(
+                "horizon.health.tps",
+                &[&names.join(", "), &tps.join(", ")],
             ));
-            lines.push(format!("MSPT ({}): {}", names.join(", "), mspt.join(", ")));
+            lines.push(tr(
+                "horizon.health.mspt",
+                &[&names.join(", "), &mspt.join(", ")],
+            ));
             (lines, stats[0].map_or(20.0, |s| s.0))
         };
         let color = color_tps(tps_now);
-        for (i, line) in lines.into_iter().enumerate() {
-            let text = Text::literal(line);
+        for (i, text) in lines.into_iter().enumerate() {
             self.system_message(if i == 0 { text.with_color(color) } else { text });
         }
         let regions = lock(&REGIONS).clone();
@@ -136,9 +144,15 @@ impl Game<'_> {
         let slowest = regions.iter().map(|r| r.ms).fold(0.0f32, f32::max);
         let average = regions.iter().map(|r| r.ms).sum::<f32>() / count.max(1) as f32;
         let late = regions.iter().filter(|r| r.late).count();
-        self.system_message(Text::literal(format!(
-            "Regions: {count} (last tick slowest {slowest:.1} ms, average {average:.1} ms; {late} still running)"
-        )));
+        self.system_message(tr(
+            "horizon.health.regions",
+            &[
+                &count,
+                &format!("{slowest:.1}"),
+                &format!("{average:.1}"),
+                &late,
+            ],
+        ));
         let mut busiest = regions;
         busiest.sort_by(|a, b| b.ms.total_cmp(&a.ms));
         for r in busiest.iter().take(5) {
@@ -147,18 +161,25 @@ impl Game<'_> {
             } else {
                 1000.0 / f64::from(r.ms)
             };
+            let late = if r.late {
+                tr("horizon.health.region.late", &[]).plain()
+            } else {
+                String::new()
+            };
             self.system_message(
-                Text::literal(format!(
-                    "  {} near {}, {}: {:.1} ms ({:.1} TPS), {} chunks, {} players{}",
-                    r.level,
-                    r.at.0,
-                    r.at.1,
-                    r.ms,
-                    ms_tps,
-                    r.chunks,
-                    r.players,
-                    if r.late { ", running late" } else { "" }
-                ))
+                tr(
+                    "horizon.health.region",
+                    &[
+                        &r.level,
+                        &r.at.0,
+                        &r.at.1,
+                        &format!("{:.1}", r.ms),
+                        &format!("{ms_tps:.1}"),
+                        &r.chunks,
+                        &r.players,
+                        &late,
+                    ],
+                )
                 .with_color(color_tps(ms_tps)),
             );
         }
@@ -180,10 +201,24 @@ impl Game<'_> {
                 })
                 .collect()
         };
-        self.system_message(Text::literal(
-            "Server tick times (avg/min/max) from last 5s, 10s, 1m:".to_owned(),
-        ));
-        self.system_message(Text::literal(format!("◴ {}", parts.join(", "))));
+        self.system_message(tr("horizon.health.mspt.title", &[]));
+        self.system_message(tr("horizon.health.mspt.values", &[&parts.join(", ")]));
         Ok(1)
+    }
+}
+
+/// A window of the health report, named in the language's own units.
+#[derive(Clone, Copy)]
+enum Span {
+    Seconds(u64),
+    Minutes(u64),
+}
+
+impl Span {
+    fn label(self) -> String {
+        match self {
+            Self::Seconds(n) => tr("horizon.health.seconds", &[&n]).plain(),
+            Self::Minutes(n) => tr("horizon.health.minutes", &[&n]).plain(),
+        }
     }
 }
