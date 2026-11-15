@@ -1138,6 +1138,11 @@ impl Game<'_> {
         if !region_threads_on() || self.regions.worker || self.regions.flight.is_some() {
             return;
         }
+        // The prelude's tick and scheduled functions run commands over the whole level: they take the old path,
+        // with the regions started after them.
+        if self.level_pass.first && self.functions_run_this_tick() {
+            return;
+        }
         let Some(set) = self.regions.resident.get(&dim) else {
             return;
         };
