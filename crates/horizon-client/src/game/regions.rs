@@ -555,9 +555,9 @@ impl Game<'_> {
     /// What every region game shares with the server's: the world's settings and tables, as they are now
     /// (copied again when they change: `/gamerule`, `/difficulty`, `/reload`).
     pub(super) fn copy_world_settings_from(&mut self, from: &Game<'_>) {
-        self.level = from.level.clone();
+        self.level.clone_from(&from.level);
         self.level_shapes = from.level_shapes;
-        self.world_root = from.world_root.clone();
+        self.world_root.clone_from(&from.world_root);
         self.world_biomes = from.world_biomes.clone();
         self.end.set_locator(from.end.locator());
         self.dim = from.dim;
@@ -579,11 +579,17 @@ impl Game<'_> {
 
     /// [`Self::copy_tick_settings_from`] but the ticket levels, which a resident region keeps for its own players.
     pub(super) fn copy_clock_from(&mut self, from: &Game<'_>) {
-        self.ui.rules = from.ui.rules.clone();
+        // Every region, every tick, on the server's thread: what rarely changes (the rules are a map, the
+        // border a shape) is compared, and copied only when it differs; the clock is a few hundred bytes.
+        if self.ui.rules != from.ui.rules {
+            self.ui.rules.clone_from(&from.ui.rules);
+        }
         self.ui.difficulty = from.ui.difficulty;
-        self.clock = from.clock.clone();
+        self.clock.clone_from(&from.clock);
         self.ticks = from.ticks;
-        self.border = from.border.clone();
+        if self.border != from.border {
+            self.border.clone_from(&from.border);
+        }
         self.level.difficulty_locked = from.level.difficulty_locked;
     }
 

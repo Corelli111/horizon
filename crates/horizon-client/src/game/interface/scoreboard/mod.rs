@@ -158,7 +158,7 @@ impl Game<'_> {
     /// remembered, so [`Self::merge_region_scores`] finds what the region changed.
     pub(super) fn lend_scoreboard_from(&mut self, from: &Game<'_>) {
         self.load_scoreboard();
-        if from.score.loaded {
+        if from.score.loaded && self.score.board != from.score.board {
             self.score.board.clone_from(&from.score.board);
         }
         self.score.lent_board = Some(self.score.board.clone());
