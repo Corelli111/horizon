@@ -245,8 +245,8 @@ pub struct Config {
 /// `[regions]`: `enabled = true` ticks the world by resident regions on threads of their own (the game's
 /// `game/regions.rs`): players in separate areas of a level are ticked in parallel. Off by default; with it off the
 /// tick is vanilla's serial one. `deadline_ms` is how long a tick waits for its regions, `resident_ticks` how many
-/// ticks a region stays on its own thread before it comes home. The environment variables `HORIZON_PARALLEL_TICK`
-/// and `HORIZON_REGION_THREADS=0` still override it.
+/// ticks a region stays on its own thread before it comes home. `[engine] parallel_tick` alone never turns it on. The
+/// environment variables `HORIZON_REGIONS=0`, `HORIZON_PARALLEL_TICK=0` and `HORIZON_REGION_THREADS=0` still override it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Regions {

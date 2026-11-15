@@ -786,12 +786,16 @@ impl Game<'_> {
     }
 }
 
-/// Whether the level's world phases run by regions on threads of their own (`HORIZON_REGION_THREADS=0` turns it
-/// off): only with the parallel tick on, on a server with players in the level.
+/// Whether the level's world phases run by regions on threads of their own. Off unless asked for by name:
+/// `HORIZON_REGIONS=1` (`[regions] enabled = true` in `server.toml` sets it; `0` or unset is off), so the generic
+/// parallel tick setting never splits a world. It also needs the parallel tick on (`HORIZON_PARALLEL_TICK=0`
+/// keeps every tick serial) and `HORIZON_REGION_THREADS=0` turns it off.
 fn region_threads_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("HORIZON_REGION_THREADS").map_or(true, |v| v.trim() != "0"))
-        && horizon_client::parallel::parallel_tick() > 0
+    *ON.get_or_init(|| {
+        std::env::var("HORIZON_REGIONS").is_ok_and(|v| matches!(v.trim(), "1" | "on" | "true"))
+            && std::env::var("HORIZON_REGION_THREADS").map_or(true, |v| v.trim() != "0")
+    }) && horizon_client::parallel::parallel_tick() > 0
 }
 
 impl Game<'_> {
@@ -805,7 +809,13 @@ impl Game<'_> {
     pub(super) fn tick_world_regions(&mut self) -> Result<bool> {
         // The End is one region while its dragon fight runs: the fight belongs to the server's thread.
         let fighting = self.dim == Dim::End && !(self.fight.killed || self.fight.previously_killed);
-        if !region_threads_on() || self.regions.worker || fighting {
+        if self.regions.worker {
+            return Ok(false);
+        }
+        if !region_threads_on() || fighting {
+            // The parallel tick went off, or the End's fight began, with regions out: they come back, or their
+            // chunks, entities and players stay frozen away from the server.
+            self.land_level_residents();
             return Ok(false);
         }
         let dim = self.dim;
@@ -1541,6 +1551,19 @@ impl Game<'_> {
             .any(|set| !set.games.is_empty())
             || self.regions.flight.is_some())
         .then(|| self.live_entity_ids().len() + lent)
+    }
+
+    /// The resident regions of the level being ticked back, those just started early included.
+    fn land_level_residents(&mut self) {
+        let dim = self.dim;
+        if self.regions.flight.as_ref().is_some_and(|f| f.0 == dim) {
+            if let Some((dim, flight)) = self.regions.flight.take() {
+                self.regions.resident.insert(dim, flight.set);
+            }
+        }
+        if let Some(set) = self.regions.resident.remove(&dim) {
+            self.land_resident_set(set);
+        }
     }
 
     /// Every resident region of every level back (before a save or a stop).

@@ -845,7 +845,8 @@ Off by default. `[regions] enabled = true` ticks the world by regions: with play
 level, each area's chunks, entities and players are ticked on a thread of their own (a resident region), so a busy
 corner does not slow the rest. The server thread still does what no region owns (joins and leaves, chat and commands,
 the End's dragon fight). It applies at the next start. It turns the parallel tick on too, since regions share its helper
-threads. With it off, the tick is vanilla's serial one.
+threads. With it off (the default), the tick is vanilla's serial one, or the older parallel tick if `[engine] parallel_tick`
+is on: that setting alone never splits the world into regions.
 
 ```toml
 [regions]
@@ -854,8 +855,8 @@ deadline_ms = 50             # how long a tick waits for its regions; a slower o
 resident_ticks = 20          # ticks a region stays on its thread before it comes home to be split anew
 ```
 
-The environment variables still override it: `HORIZON_PARALLEL_TICK=0` keeps every tick serial, `HORIZON_REGION_THREADS=0`
-keeps the older parallel tick without regions, and `HORIZON_REGION_DEADLINE_MS` and `HORIZON_RESIDENT_TICKS` set the two
+The environment variables still override it: `HORIZON_PARALLEL_TICK=0` keeps every tick serial, `HORIZON_REGIONS=0` or
+`HORIZON_REGION_THREADS=0` keep the older parallel tick without regions (`HORIZON_REGIONS=1` is what `enabled = true` sets), and `HORIZON_REGION_DEADLINE_MS` and `HORIZON_RESIDENT_TICKS` set the two
 numbers.
 
 ### Mob AI far from players: `[entities] dab`

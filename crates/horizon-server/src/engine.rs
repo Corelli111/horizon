@@ -238,10 +238,12 @@ fn command(
     if parallel_tick {
         command.env("HORIZON_PARALLEL_TICK", "1");
     }
-    // `[regions] enabled`: region ticking runs on the parallel tick's helpers, so it turns both on, and passes its
-    // two numbers. A variable the operator already set wins, so `HORIZON_PARALLEL_TICK=0` still turns it off.
+    // `[regions] enabled`: region ticking has a switch of its own (`HORIZON_REGIONS`), which `parallel_tick` alone
+    // never turns on. It runs on the parallel tick's helpers, so it turns that on too, and passes its two numbers.
+    // A variable the operator already set wins, so `HORIZON_PARALLEL_TICK=0` or `HORIZON_REGIONS=0` still turn it off.
     if regions.enabled {
         for (name, value) in [
+            ("HORIZON_REGIONS", "1".to_owned()),
             ("HORIZON_PARALLEL_TICK", "1".to_owned()),
             (
                 "HORIZON_REGION_DEADLINE_MS",
@@ -471,7 +473,9 @@ mod tests {
             env(on.clone(), "HORIZON_REGION_DEADLINE_MS").as_deref(),
             Some("30")
         );
-        assert_eq!(env(on, "HORIZON_PARALLEL_TICK").as_deref(), Some("1"));
+        assert_eq!(env(on.clone(), "HORIZON_PARALLEL_TICK").as_deref(), Some("1"));
+        assert_eq!(env(on, "HORIZON_REGIONS").as_deref(), Some("1"));
+        assert_eq!(env(Regions::default(), "HORIZON_REGIONS"), None);
     }
 
     #[test]
