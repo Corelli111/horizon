@@ -1612,6 +1612,20 @@ fn drain<T>(list: &mut JoinList<T>) -> Vec<T> {
     std::mem::take(list).into()
 }
 
+/// [`split`] for a level's list of entities: what no region owns stays in `list`. (Splitting a drained copy
+/// would drop every entity outside the regions' sections along with it: the chunks they stand in are saved
+/// without them.)
+fn split_list<T>(
+    list: &mut JoinList<T>,
+    regions: &Regions,
+    at: impl Fn(&T) -> (f64, f64),
+) -> Vec<Vec<T>> {
+    let mut all = drain(list);
+    let out = split(&mut all, regions, at);
+    *list = all.into();
+    out
+}
+
 /// A map's entries whose block a region owns, moved into that region's map.
 fn split_map<K: std::hash::Hash + Eq + Copy, V>(
     m: &mut HashMap<K, V>,
@@ -1727,29 +1741,30 @@ impl Game<'_> {
         let v3 = |p: &horizon_core::geometry::Vec3| (p.x, p.z);
         let a3 = |p: &[f64; 3]| (p[0], p[2]);
         let b3 = |p: &[i32; 3]| (f64::from(p[0]), f64::from(p[2]));
-        let mut mobs = split(&mut drain(&mut self.mobs), regions, |m| v3(&m.position));
-        let mut dropped = split(&mut drain(&mut self.dropped), regions, |d| v3(&d.position));
-        let mut orbs = split(&mut drain(&mut self.orbs), regions, |o| v3(&o.position));
-        let mut projectiles = split(&mut drain(&mut self.creatures.projectiles), regions, |p| {
-            v3(&p.position)
-        });
-        let mut falling = split(&mut drain(&mut self.falling), regions, |f| v3(&f.position));
+        let mut mobs = split_list(&mut self.mobs, regions, |m| v3(&m.position));
+        let mut dropped = split_list(&mut self.dropped, regions, |d| v3(&d.position));
+        let mut orbs = split_list(&mut self.orbs, regions, |o| v3(&o.position));
+        let mut projectiles =
+            split_list(
+                &mut self.creatures.projectiles,
+                regions,
+                |p| v3(&p.position),
+            );
+        let mut falling = split_list(&mut self.falling, regions, |f| v3(&f.position));
         let mut paintings = split(&mut self.paintings, regions, |p| b3(&p.pos));
         let mut item_frames = split(&mut self.item_frames, regions, |f| b3(&f.pos));
-        let mut armor_stands = split(&mut drain(&mut self.armor_stands), regions, |s| {
-            v3(&s.position)
-        });
+        let mut armor_stands = split_list(&mut self.armor_stands, regions, |s| v3(&s.position));
         let mut cushions = split(&mut self.cushions, regions, |c| v3(&c.position));
         let mut others = split(&mut self.others, regions, |o| v3(&o.position));
-        let mut boats = split(&mut drain(&mut self.boats), regions, |b| v3(&b.position));
-        let mut carts = split(&mut drain(&mut self.carts), regions, |c| v3(&c.position));
+        let mut boats = split_list(&mut self.boats, regions, |b| v3(&b.position));
+        let mut carts = split_list(&mut self.carts, regions, |c| v3(&c.position));
         let mut bolts = split(&mut self.bolts, regions, |b| a3(&b.at));
         let mut crystals = split(&mut self.crystals, regions, |c| v3(&c.position));
         let mut breath_clouds = split(&mut self.breath_clouds, regions, |b| a3(&b.at));
-        let mut tridents = split(&mut drain(&mut self.tridents), regions, |t| v3(&t.position));
-        let mut rockets = split(&mut drain(&mut self.rockets), regions, |r| v3(&r.position));
+        let mut tridents = split_list(&mut self.tridents, regions, |t| v3(&t.position));
+        let mut rockets = split_list(&mut self.rockets, regions, |r| v3(&r.position));
         let mut ominous_spawners = split(&mut self.ominous_spawners, regions, |o| a3(&o.position));
-        let mut tnts = split(&mut drain(&mut self.tnts), regions, |t| v3(&t.position));
+        let mut tnts = split_list(&mut self.tnts, regions, |t| v3(&t.position));
         let mut hoppers = split_map(&mut self.hoppers, regions, |p| block_chunk(*p));
         let mut jukebox_sounds = split_map(&mut self.jukebox_sounds, regions, |p| block_chunk(*p));
         let mut lid_openers = split_map(&mut self.lid_openers, regions, |p| block_chunk(*p));
@@ -1875,5 +1890,19 @@ mod tests {
         let again = Regions::new([], &players, 8);
         assert_eq!(r.firsts, again.firsts);
         assert_eq!(r.of_block(-3.5, 0.0), r.of_block(0.0, 0.0));
+    }
+
+    #[test]
+    fn splitting_a_list_keeps_what_no_region_owns() {
+        // One region around chunk 0 (blocks -64..128); the entity at x = 1000 stands in no region's chunks.
+        let regions = Regions::new([(0, 0)], &[(0, 0)], 0);
+        let mut mobs: JoinList<(u32, f64)> = vec![(1, 5.0), (2, 1000.0), (3, 20.0)].into();
+        let parts = split_list(&mut mobs, &regions, |m| (m.1, 0.0));
+        assert_eq!(parts.len(), 1);
+        let lent: Vec<u32> = parts[0].iter().map(|m| m.0).collect();
+        assert_eq!(lent, [1, 3]);
+        // The level keeps the far entity: a save of its chunk still writes it.
+        let kept: Vec<u32> = mobs.iter().map(|m| m.0).collect();
+        assert_eq!(kept, [2]);
     }
 }
