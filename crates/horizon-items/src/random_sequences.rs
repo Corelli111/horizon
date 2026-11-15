@@ -257,8 +257,14 @@ mod tests {
         parts.remove(0);
         let before = level.clone();
         // Region 1 draws (and makes a stream of its own); region 2 does not.
-        let drawn = parts[0].get("minecraft:y", 42).next_int_bound(1_000_000).unwrap();
-        parts[0].get("minecraft:x", 42).next_int_bound(1_000_000).unwrap();
+        let drawn = parts[0]
+            .get("minecraft:y", 42)
+            .next_int_bound(1_000_000)
+            .unwrap();
+        parts[0]
+            .get("minecraft:x", 42)
+            .next_int_bound(1_000_000)
+            .unwrap();
         let mut resumed = parts[0].clone();
         let idle = parts.remove(1);
         level.absorb(idle);
@@ -266,8 +272,14 @@ mod tests {
         assert!(level.take_dirty_nbt().is_none());
         level.absorb(parts.remove(0));
         assert!(level.take_dirty_nbt().is_some());
-        let next = level.get("minecraft:x", 42).next_int_bound(1_000_000).unwrap();
-        let expected = resumed.get("minecraft:x", 42).next_int_bound(1_000_000).unwrap();
+        let next = level
+            .get("minecraft:x", 42)
+            .next_int_bound(1_000_000)
+            .unwrap();
+        let expected = resumed
+            .get("minecraft:x", 42)
+            .next_int_bound(1_000_000)
+            .unwrap();
         assert_eq!(next, expected);
         assert!(level.ids().contains(&"minecraft:y".to_owned()));
         let _ = drawn;

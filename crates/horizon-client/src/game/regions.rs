@@ -531,7 +531,6 @@ impl Game<'_> {
         }
     }
 
-
     /// What every region game shares with the server's: the world's settings and tables, as they are now
     /// (copied again when they change: `/gamerule`, `/difficulty`, `/reload`).
     pub(super) fn copy_world_settings_from(&mut self, from: &Game<'_>) {

@@ -484,7 +484,9 @@ impl World {
         // behind another's (a cache keyed on the count sees every landing that changed something).
         let wrote = revision.wrapping_sub(lent_revision);
         let changed = wrote > 0 || !modified.is_empty() || !dirty_light.is_empty();
-        self.revision = self.revision.wrapping_add(if changed { wrote.max(1) } else { 0 });
+        self.revision = self
+            .revision
+            .wrapping_add(if changed { wrote.max(1) } else { 0 });
         // The region's maps replace the server's copies for its chunks: a chest closed or a container name
         // dropped by the region's ticks must not stay on the server (an "open" chest forever, a name that passes
         // to the next block placed there).
@@ -1211,7 +1213,9 @@ mod region_tests {
         world.chunks.insert((0, 0), Arc::new(Chunk::empty(0, 0)));
         world.chunks.insert((5, 0), Arc::new(Chunk::empty(0, 0)));
         world.chest_openers.insert((1, 64, 1), (2, 3.0));
-        world.block_names.insert((2, 64, 2), horizon_world::nbt::Tag::String("old".into()));
+        world
+            .block_names
+            .insert((2, 64, 2), horizon_world::nbt::Tag::String("old".into()));
         // Another chunk, not lent: stays.
         world.chest_openers.insert((81, 64, 1), (1, 4.0));
         let mut parts = world.lend(1, |(x, _)| (x == 0).then_some(0), &[5]);

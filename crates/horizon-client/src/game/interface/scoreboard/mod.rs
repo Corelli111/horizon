@@ -176,7 +176,12 @@ impl Game<'_> {
         for (holder, scores) in &w.score.board.scores {
             for (objective, score) in scores {
                 if lent.score(holder, objective).map(|s| s.value) == Some(score.value)
-                    || !self.score.board.objectives.iter().any(|o| &o.name == objective)
+                    || !self
+                        .score
+                        .board
+                        .objectives
+                        .iter()
+                        .any(|o| &o.name == objective)
                 {
                     continue;
                 }

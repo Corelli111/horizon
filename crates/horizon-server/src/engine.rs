@@ -473,7 +473,10 @@ mod tests {
             env(on.clone(), "HORIZON_REGION_DEADLINE_MS").as_deref(),
             Some("30")
         );
-        assert_eq!(env(on.clone(), "HORIZON_PARALLEL_TICK").as_deref(), Some("1"));
+        assert_eq!(
+            env(on.clone(), "HORIZON_PARALLEL_TICK").as_deref(),
+            Some("1")
+        );
         assert_eq!(env(on, "HORIZON_REGIONS").as_deref(), Some("1"));
         assert_eq!(env(Regions::default(), "HORIZON_REGIONS"), None);
     }
