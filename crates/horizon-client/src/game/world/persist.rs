@@ -1993,7 +1993,8 @@ impl Game<'_> {
             let written: usize = chunks.iter().map(|(_, e)| e.len()).sum();
             if before > 0 && written == 0 {
                 log::warn!(
-                    "regions: save lost entities: {before} in memory before landing the regions, {written} written"
+                    "regions: save lost entities in {}: {before} in memory before landing its regions, {written} written",
+                    self.dim.id()
                 );
             }
         }

@@ -814,6 +814,14 @@ impl Game<'_> {
         if self.regions.worker {
             return Ok(());
         }
+        // The server's own ids come from the shared pool whenever its block runs low, whichever level ticks and
+        // split or not: a level that is never split (the End) spawning past its block would hand out the ids
+        // the region games of other levels are about to take.
+        if self.regions.entity_id_end != 0
+            && let Some(pool) = self.regions.entity_pool.clone()
+        {
+            self.refill_entity_ids(&pool);
+        }
         if !region_threads_on() || fighting {
             // The parallel tick went off, or the End's fight began, with regions out: they come back, or their
             // chunks, entities and players stay frozen away from the server.
@@ -1279,12 +1287,15 @@ impl Game<'_> {
         }
         // Where its players stand: the areas the server keeps loaded for them.
         if let Some(host) = self.lan.as_mut() {
-            host.hub.away_places = set
+            let places = set
                 .games
                 .iter()
                 .filter(|s| !s.landed)
                 .flat_map(|s| s.places.iter().copied())
                 .collect();
+            host.hub
+                .away_places
+                .insert(self.dim.id().to_owned(), places);
         }
         if let Some(e) = failed {
             // A region that panicked or could not start does not fail the server's tick: the regions come home,
@@ -1515,7 +1526,7 @@ impl Game<'_> {
         }
         if let Some(host) = host.as_mut() {
             host.hub.release_away();
-            host.hub.away_places.clear();
+            host.hub.away_places.remove(dim.id());
             host.hub.restore_guest_order();
         }
         self.lan = host;
@@ -1622,27 +1633,34 @@ impl Game<'_> {
         });
     }
 
-    /// How many entities the level holds now, with those lent to resident regions that are home to be counted
-    /// (a region still ticking past its deadline is not).
+    /// How many entities the level in place holds now, with those lent to its resident regions that are home to be
+    /// counted (a region still ticking past its deadline is not). Only this level's: another level's regions hold
+    /// entities this level's save never writes. `None` while none of its regions is out.
     pub(super) fn entities_with_residents(&self) -> Option<usize> {
-        let lent: usize = self
-            .regions
-            .resident
-            .values()
-            .chain(self.regions.flight.iter().map(|(_, f)| &f.set))
+        let dim = self.dim;
+        let sets = || {
+            self.regions
+                .resident
+                .get(&dim)
+                .into_iter()
+                .chain(
+                    self.regions
+                        .flight
+                        .iter()
+                        .filter(move |(d, _)| *d == dim)
+                        .map(|(_, f)| &f.set),
+                )
+                .filter(|set| !set.games.is_empty())
+        };
+        // Nothing is lent: nothing a save could miss.
+        sets().next()?;
+        let lent: usize = sets()
             .flat_map(|set| set.games.iter())
             .filter(|s| !s.landed)
             .filter_map(|s| s.game.as_ref())
             .map(|w| w.live_entity_ids().len())
             .sum();
-        // Nothing is lent: nothing a save could miss.
-        (self
-            .regions
-            .resident
-            .values()
-            .any(|set| !set.games.is_empty())
-            || self.regions.flight.is_some())
-        .then(|| self.live_entity_ids().len() + lent)
+        Some(self.live_entity_ids().len() + lent)
     }
 
     /// Brings every resident region home when this tick runs datapack functions (the `load` and `tick` tags, or a
@@ -1668,6 +1686,15 @@ impl Game<'_> {
             return;
         }
         self.land_residents();
+    }
+
+    /// Whether `dim` has resident regions (lent players, entities and chunks), those just started early included.
+    pub(super) fn level_has_residents(&self, dim: Dim) -> bool {
+        self.regions
+            .resident
+            .get(&dim)
+            .is_some_and(|set| !set.games.is_empty())
+            || self.regions.flight.as_ref().is_some_and(|f| f.0 == dim)
     }
 
     /// The resident regions of the level being ticked back, those just started early included.
