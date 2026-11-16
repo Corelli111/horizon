@@ -579,6 +579,16 @@ impl Game<'_> {
             let start = pool.fetch_add(ID_BLOCK, Ordering::Relaxed);
             self.next_entity = start;
             self.regions.entity_id_end = start + ID_BLOCK;
+            // The block is fresh: whatever is remembered under its ids is a dead entity's, and a new entity
+            // must not inherit its UUID or saved data (the pool winds back in `trim_entity_ids`).
+            if !self.persist.uuids.is_empty() || !self.persist.raw.is_empty() {
+                let end = start + ID_BLOCK;
+                self.persist.uuids.retain(|id, _| *id < start || *id >= end);
+                self.persist.raw.retain(|id, _| *id < start || *id >= end);
+                self.persist
+                    .passenger_slots
+                    .retain(|id, _| *id < start || *id >= end);
+            }
         }
     }
 }
@@ -688,6 +698,9 @@ impl Game<'_> {
         w: &mut Game<'_>,
         chunks: &[ChunkPos],
     ) -> horizon_client::random_sequences::RandomSequences {
+        // What the region remembers of entities that died there dies with them, before it is handed back: a
+        // stale record would outlive its id and be inherited by whichever entity reuses it.
+        w.prune_entity_memory();
         self.merge_region_scores(w);
         let stand_in = self.world.stand_in();
         let region_world = std::mem::replace(&mut w.world, stand_in);
@@ -1546,6 +1559,12 @@ impl Game<'_> {
             game.regions.entity_id_end = 0;
         }
         pool.store(high.saturating_add(1), Ordering::Relaxed);
+        // Nothing alive holds an id above `high`; what is remembered there is a dead entity's, and the
+        // ids are handed out again from the pool.
+        self.forget_ids_from(high.saturating_add(1));
+        for game in self.regions.idle.values_mut().flatten() {
+            game.forget_ids_from(high.saturating_add(1));
+        }
         // The server's own block ends where it stands: its next refill takes a block from the pool again.
         self.regions.entity_id_end = self.next_entity;
     }

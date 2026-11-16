@@ -1986,6 +1986,7 @@ impl Game<'_> {
     /// without `saveAll`'s flush.
     pub(super) fn save_entities(&mut self, wait: bool) -> Result<()> {
         self.spawn_loaded_entities();
+        self.unique_entity_uuids();
         let keys: HashSet<(i32, i32)> = self.world.chunks.keys().copied().collect();
         let chunks = self.entity_chunks(&keys, false);
         if let Some(before) = self.regions.entities_before_save.take() {
@@ -2091,6 +2092,31 @@ impl Game<'_> {
                 self.score.board.entity_removed(&uuid_text(uuid));
             }
         }
+    }
+    /// A saved world never holds two entities under one UUID (vanilla drops the second on load): when two
+    /// remembered ids carry the same UUID, the higher id, the later entity, gets a fresh one.
+    pub(super) fn unique_entity_uuids(&mut self) {
+        let mut ids: Vec<u32> = self.persist.uuids.keys().copied().collect();
+        ids.sort_unstable();
+        let mut seen: HashSet<[i32; 4]> = HashSet::with_capacity(ids.len());
+        for id in ids {
+            let uuid = self.persist.uuids[&id];
+            if !seen.insert(uuid) {
+                let mut fresh = random_uuid();
+                while !seen.insert(fresh) {
+                    fresh = random_uuid();
+                }
+                log::warn!("entity {id} shared a UUID with an earlier entity: it gets a new one");
+                self.persist.uuids.insert(id, fresh);
+            }
+        }
+    }
+    /// Drops what is remembered for ids from `start` up: nothing alive holds them, so it belongs to entities
+    /// that are gone, and the ids are about to be handed out again.
+    pub(super) fn forget_ids_from(&mut self, start: u32) {
+        self.persist.uuids.retain(|id, _| *id < start);
+        self.persist.raw.retain(|id, _| *id < start);
+        self.persist.passenger_slots.retain(|id, _| *id < start);
     }
     pub(super) fn prune_entity_memory(&mut self) {
         if !self.persist.removed_vehicles.is_empty()

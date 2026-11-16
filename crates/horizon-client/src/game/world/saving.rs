@@ -204,6 +204,7 @@ impl Game<'_> {
                     }
                     if keys.is_empty() {
                         self.spawn_loaded_entities();
+                        self.unique_entity_uuids();
                         save.stage = Stage::Entities(self.world.chunks.keys().copied().collect());
                     }
                     Ok(false)
