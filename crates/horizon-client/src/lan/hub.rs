@@ -3115,6 +3115,10 @@ impl Hub {
             .partition(|e| matches!(e, NetEvent::Packet(c, ..) | NetEvent::Left(c, _) if conns.contains(c)));
         self.away_events = kept;
         self.replay.extend(mine);
+        // A duplicate login belongs to no connection: it waits for the last region to be home.
+        if self.away.is_empty() {
+            self.replay.append(&mut self.away_events);
+        }
     }
 
     /// The players are back: what waited for them is for the next poll.

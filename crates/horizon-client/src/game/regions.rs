@@ -1511,7 +1511,11 @@ impl Game<'_> {
         let mut host = self.lan.take();
         let mut back = Vec::with_capacity(set.games.len());
         let mut lost = false;
+        // Whose packets were held for this set's regions: only theirs are released below. Another level's resident
+        // regions keep theirs away.
+        let mut conns: Vec<u32> = Vec::new();
         for (mut slot, chunks) in set.games.into_iter().zip(set.chunks) {
+            conns.extend(slot.conns.iter().copied());
             // One still ticking is waited for.
             let _ = slot.home(None);
             let Some(mut w) = slot.game.take() else {
@@ -1535,7 +1539,10 @@ impl Game<'_> {
             back.push(w);
         }
         if let Some(host) = host.as_mut() {
-            host.hub.release_away();
+            // Not `release_away`: it frees every away connection, those of another level's resident regions too,
+            // whose players' packets (their commands among them) then found no guest at the next poll and were
+            // dropped.
+            host.hub.release_away_conns(&conns);
             host.hub.away_places.remove(dim.id());
             host.hub.restore_guest_order();
         }
