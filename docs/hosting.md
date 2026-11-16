@@ -855,8 +855,8 @@ deadline_ms = 50             # how long a tick waits for its regions; a slower o
 resident_ticks = 20          # ticks a region stays on its thread before it comes home to be split anew
 ```
 
-`/tps` (TPS and tick times, and each region's last tick) and `/mspt` are Horizon's own commands, so they are there with
-`horizon-pregen = true` under `[properties]`, as `/pregen` is.
+`/tps` (TPS and tick times, and each region's last tick) and `/mspt` are Horizon's own commands. A dedicated server
+always has them (operators only), whether or not `horizon-pregen` is on.
 
 The environment variables still override it: `HORIZON_PARALLEL_TICK=0` keeps every tick serial, `HORIZON_REGIONS=0` or
 `HORIZON_REGION_THREADS=0` keep the older parallel tick without regions (`HORIZON_REGIONS=1` is what `enabled = true` sets), and `HORIZON_REGION_DEADLINE_MS` and `HORIZON_RESIDENT_TICKS` set the two
