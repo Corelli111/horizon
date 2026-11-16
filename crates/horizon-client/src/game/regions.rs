@@ -1576,8 +1576,11 @@ impl Game<'_> {
         for game in self.regions.idle.values_mut().flatten() {
             game.forget_ids_from(high.saturating_add(1));
         }
-        // The server's own block ends where it stands: its next refill takes a block from the pool again.
+        // The server's own block ends where it stands, and takes a fresh one from the wound-back pool at once:
+        // whatever the server spawns before its next tick (a summon, a chunk's mobs) must not take ids the
+        // pool hands out again to regions or to its own next refill.
         self.regions.entity_id_end = self.next_entity;
+        self.refill_entity_ids(&pool);
     }
 
     /// The players native mods can see: those away in a resident region, as it last reported them.
