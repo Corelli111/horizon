@@ -849,6 +849,12 @@ impl Game<'_> {
             }
             entered = std::time::Instant::now();
         }
+        // A player a command or a native mod just sent to another level waits for the server's hand to move them
+        // (`run_level_teleports`, later in this tick): lent to a region now, they would not be found and the
+        // teleport would be lost. The level is split again once it has run.
+        if !self.level_teleports.is_empty() {
+            return Ok(());
+        }
         if self.regions.paused > 0 {
             self.regions.paused -= 1;
             return Ok(());
