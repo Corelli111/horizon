@@ -703,7 +703,11 @@ impl Game<'_> {
         w.prune_entity_memory();
         self.merge_region_scores(w);
         let stand_in = self.world.stand_in();
-        let region_world = std::mem::replace(&mut w.world, stand_in);
+        let mut region_world = std::mem::replace(&mut w.world, stand_in);
+        // Entities the region's chunks loaded that it has not added yet go to the server's list: its next
+        // spawn step adds them, into the chunks that are home now.
+        let waiting = std::mem::take(&mut region_world.loaded_entities);
+        self.world.loaded_entities.extend(waiting);
         let region_ticks = std::mem::take(&mut w.block_ticks);
         let region_sections = std::mem::take(&mut w.random_tick_sections);
         let world = &mut self.world;
@@ -1946,6 +1950,9 @@ impl Game<'_> {
         let n = regions.parts();
         let first = regions.only_region().unwrap_or(0);
         let of_chunk = |key: (i32, i32)| regions.of_chunk(key);
+        // Entities read from chunk files still wait in the world: they join the level first (the step a tick
+        // takes), or they would be added to chunks this game no longer holds once those went to a region.
+        self.spawn_loaded_entities();
         let mut chunks: Vec<Vec<ChunkPos>> = vec![Vec::new(); n];
         for &(x, z) in self.world.chunks.keys() {
             if let Some(r) = of_chunk((x, z)) {
