@@ -201,5 +201,60 @@ def spawn(rng, seed):
     return {'family': 'spawn', 'seed': seed, 'steps': steps}
 
 
-FAMILIES = {'persist': persist, 'spawn': spawn}
+def shulker(rng, seed):
+    """Shulkers duplicating (a bullet hits one) or shooting (a player stands in reach), read tick by tick.
+
+    `clone`: shulkers of mixed lid, colour, face and health stand close together; a shulker bullet is summoned and `/damage ... mob_projectile by <bullet> from <another shulker>`
+    reaches `Shulker.hurtServer`'s `hitByShulkerBullet`: the teleport, the count of shulkers within 8 blocks, the
+    level's random draw, the baby left behind. `shoot`: one shulker with its AI, the player teleported beside it:
+    the target goal, the attack goal's lid and timer, each bullet's start and flight, read every few ticks.
+    """
+    if rng.random() < 0.6:
+        count = rng.randint(2, 6)
+        steps = []
+        for i in range(count):
+            # Shulker 0 is the one hit: open, so `hitByShulkerBullet` clones it when it can.
+            peek = rng.choice(['30b', '100b']) if i == 0 or rng.random() < 0.5 else '0b'
+            # With its AI: `teleportSomewhere` does nothing for a NoAI shulker, so none would ever clone.
+            nbt = {'PersistenceRequired': '1b', 'Peek': peek,
+                   'AttachFace': '0b' if rng.random() < 0.8 else rng.choice(['1b', '2b', '3b', '4b', '5b'])}
+            if rng.random() < 0.5:
+                nbt['Color'] = f'{rng.randint(0, 15)}b'
+            if i == 0 and rng.random() < 0.2:
+                nbt['Health'] = rng.choice(['3.0f', '14.0f', '29.0f'])
+            at = [6.5 + rng.randint(0, 3), 0, 6.5 + rng.randint(0, 3)] if i else [7.5, 0, 7.5]
+            steps.append({'k': 'summon', 'type': 'shulker', 'at': at, 'n': i, 'nbt': nbt})
+        owner = rng.randint(1, count - 1)
+        if rng.random() < 0.7:  # the damage of a bullet that never flew, from another shulker
+            steps.append({'k': 'summon', 'type': 'shulker_bullet', 'at': [9.5, 2, 9.5], 'n': 20,
+                          'nbt': {'NoGravity': '1b'}})
+            steps.append({'k': 'cmd', 'at': [], 'uuids': True,
+                          'cmd': f'/damage {uuid_arg(0)} 1 minecraft:mob_projectile by {uuid_arg(20)} from {uuid_arg(owner)}'})
+        else:  # a bullet above the shulker, homing on it, its owner another shulker
+            steps.append({'k': 'summon', 'type': 'shulker_bullet', 'at': [7.5, 3.5, 7.5], 'n': 20,
+                          'nbt': {'Owner': '{iu%d}' % owner, 'Steps': '10', 'Dir': '"down"', 'Target': '{iu0}'}})
+        for _ in range(rng.choice([2, 3, 4])):
+            steps += [{'k': 'tick', 'n': 1},
+                      {'k': 'cmd', 'at': [[7, 0, 7]], 'cmd': '/execute positioned {0} if entity @e[type=shulker,distance=..40]'},
+                      {'k': 'read_near', 'type': 'shulker', 'at': [7, 0, 7]}]
+        steps += [{'k': 'read_entity', 'n': i} for i in range(count)]
+        return {'family': 'shulker', 'seed': seed, 'steps': steps}
+    nbt = {'PersistenceRequired': '1b', 'AttachFace': rng.choice(['0b', '0b', '1b', '2b', '3b', '4b', '5b'])}
+    if rng.random() < 0.3:
+        nbt['Peek'] = rng.choice(['30b', '100b'])
+    dx, dz = rng.choice([(4, 0), (-4, 0), (0, 4), (0, -4), (3, 3), (6, 0), (0, 8)])
+    steps = [{'k': 'summon', 'type': 'shulker', 'at': [7.5, 0, 7.5], 'n': 0, 'nbt': nbt},
+             {'k': 'cmd', 'at': [[7 + dx, 0, 7 + dz]], 'cmd': '/tp @a {0}'}]
+    for _ in range(rng.choice([4, 5, 6])):
+        steps += [{'k': 'tick', 'n': rng.choice([5, 10, 12])}, {'k': 'read_near', 'type': 'shulker_bullet', 'at': [7, 0, 7]},
+                  {'k': 'read_entity', 'n': 0}]
+    return {'family': 'shulker', 'seed': seed, 'steps': steps}
+
+
+def uuid_arg(n):
+    """A fuzz entity's UUID in a command, from the placeholder the renderer fills with the slot (`uuid_text`)."""
+    return '{u%d}' % n
+
+
+FAMILIES = {'persist': persist, 'spawn': spawn, 'shulker': shulker}
 

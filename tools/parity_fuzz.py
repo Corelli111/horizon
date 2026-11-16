@@ -215,11 +215,16 @@ def render(scenario, slot):
         kind = step['k']
         if kind == 'summon':
             nbt = {'UUID': '[I;' + ','.join(map(str, uuid_words(slot, step['n']))) + ']', **step['nbt']}
-            ops.append(cmd(f'/summon {step["type"]} {at(step["at"])} {snbt(nbt)}', i))
+            text = snbt(nbt)  # `{iuN}`: the UUID of the entity summoned as n=N, as an int array
+            text = re.sub(r'\{iu(\d+)\}', lambda m: '[I;' + ','.join(map(str, uuid_words(slot, int(m.group(1))))) + ']', text)
+            ops.append(cmd(f'/summon {step["type"]} {at(step["at"])} {text}', i))
         elif kind == 'block':
             ops.append(cmd(f'/setblock {at(step["at"])} {step["block"]}{snbt(step.get("nbt") or {}) if step.get("nbt") else ""}', i))
         elif kind == 'cmd':
-            ops.append(cmd(step['cmd'].format(*[at(o) for o in step.get('at', [])]), i))
+            text = step['cmd']
+            if step.get('uuids'):  # `{uN}`: the UUID of the entity summoned as n=N
+                text = re.sub(r'\{u(\d+)\}', lambda m: uuid_text(uuid_words(slot, int(m.group(1)))), text)
+            ops.append(cmd(text.format(*[at(o) for o in step.get('at', [])]), i))
         elif kind == 'tick':
             ops.append({'op': 'tick', 'n': step['n']})
         elif kind == 'dispense':
@@ -249,6 +254,8 @@ def render(scenario, slot):
             ops.append({**cmd(f'/data get block {at(step["at"])}', i), 'read': True})
         else:
             raise ValueError(kind)
+    if any('/tp @a' in s.get('cmd', '') for s in scenario['steps']):  # the player goes home
+        ops.append(cmd('/tp @a 8.5 230 8.5', -1, False))
     ops += [cmd(f'/kill @e[type=!player,x={x0},y={y0 - 8},z={z0},dx=16,dy=48,dz=16]', -1, False),
             cmd(f'/fill {x0} {y0 - 1} {z0} {x0 + 15} {y0 + 12} {z0 + 15} minecraft:air', -1, False),
             cmd(f'/forceload remove {x0} {z0}', -1, False)]
