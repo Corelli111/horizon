@@ -1759,6 +1759,9 @@ impl Game<'_> {
         if self.lan.is_none() {
             return (false, Vec::new());
         }
+        if self.lan_acting.is_none() {
+            self.land_residents_for_native_command();
+        }
         let base = self.server_source();
         let server = execute::Source {
             dimension: Dim::Overworld,

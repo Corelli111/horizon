@@ -1639,6 +1639,18 @@ impl Game<'_> {
         self.land_residents();
     }
 
+    /// Brings every resident region home before a native mod runs a command (`/tp`, `/execute`...): its selectors
+    /// and teleports find players and chunks in the server's own game only, and a player away in a region is
+    /// not there, so the command would fail ("no entity was found"). A no-op where nothing is away.
+    pub(super) fn land_residents_for_native_command(&mut self) {
+        if self.regions.worker
+            || (self.regions.resident.is_empty() && self.regions.flight.is_none())
+        {
+            return;
+        }
+        self.land_residents();
+    }
+
     /// The resident regions of the level being ticked back, those just started early included.
     fn land_level_residents(&mut self) {
         let dim = self.dim;
