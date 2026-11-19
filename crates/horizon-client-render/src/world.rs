@@ -1218,7 +1218,7 @@ mod region_tests {
         world.chest_openers.insert((1, 64, 1), (2, 3.0));
         world
             .block_names
-            .insert((2, 64, 2), horizon_world::nbt::Tag::String("old".into()));
+            .insert((2, 64, 2), horizon_core::nbt::Tag::String("old".into()));
         // Another chunk, not lent: stays.
         world.chest_openers.insert((81, 64, 1), (1, 4.0));
         let mut parts = world.lend(1, |(x, _)| (x == 0).then_some(0), &[5]);
