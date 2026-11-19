@@ -1130,7 +1130,18 @@ fn restart_is_only_on_a_supervised_dedicated_server_and_asks_for_stop_permission
                     .find("restart")
                     .is_none()
             );
-            let d = vanilla::game_tree_with(dev, horizon, true, true);
+            let registry = horizon_client_core::gamerules::RuleRegistry::vanilla();
+            let d = vanilla::session_tree(&registry, &[], dev, horizon, true, true);
+            assert!(
+                vanilla::session_tree(&registry, &[], dev, horizon, true, false)
+                    .find("restart")
+                    .is_none()
+            );
+            assert!(
+                vanilla::session_tree(&registry, &[], dev, horizon, false, true)
+                    .find("restart")
+                    .is_none()
+            );
             let restart = d
                 .find("restart")
                 .expect("supervised dedicated tree has /restart");

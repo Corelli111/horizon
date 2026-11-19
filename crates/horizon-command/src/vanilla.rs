@@ -606,6 +606,18 @@ pub fn session_dispatcher(registry: &RuleRegistry, features: &[String]) -> Dispa
     let dev = std::env::var_os("HORIZON_DEV_COMMANDS").is_some();
     let horizon = HORIZON_COMMANDS.load(std::sync::atomic::Ordering::Relaxed);
     let dedicated = DEDICATED_COMMANDS.load(std::sync::atomic::Ordering::Relaxed);
+    let supervised = SUPERVISED_COMMANDS.load(std::sync::atomic::Ordering::Relaxed);
+    session_tree(registry, features, dev, horizon, dedicated, supervised)
+}
+
+pub(crate) fn session_tree(
+    registry: &RuleRegistry,
+    features: &[String],
+    dev: bool,
+    horizon: bool,
+    dedicated: bool,
+    supervised: bool,
+) -> Dispatcher {
     let mut tree = build_for_features(
         dev,
         dedicated,
@@ -615,7 +627,7 @@ pub fn session_dispatcher(registry: &RuleRegistry, features: &[String]) -> Dispa
     if horizon {
         horizon_commands(&mut tree, 0);
     }
-    if dedicated && SUPERVISED_COMMANDS.load(std::sync::atomic::Ordering::Relaxed) {
+    if dedicated && supervised {
         supervised_commands(&mut tree, 0);
     }
     // Game-session tooling, not part of vanilla's reference/parity dispatcher.
@@ -657,7 +669,10 @@ pub fn set_supervised_commands(on: bool) {
     SUPERVISED_COMMANDS.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 fn tree_slot(dev: bool, horizon: bool, dedicated: bool, supervised: bool) -> usize {
-    usize::from(dev) | usize::from(horizon) << 1 | usize::from(dedicated) << 2 | usize::from(supervised) << 3
+    usize::from(dev)
+        | usize::from(horizon) << 1
+        | usize::from(dedicated) << 2
+        | usize::from(supervised) << 3
 }
 /// The server.properties key that turns `/pregen` on (Horizon's own; vanilla
 /// ignores keys it doesn't know).
