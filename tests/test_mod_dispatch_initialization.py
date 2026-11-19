@@ -14,7 +14,7 @@ TEST = re.compile(r'#\[test\]\s*(?:#\[[^\n]*\]\s*)*fn (\w+)\([^)]*\)\s*\{')
 DISPATCH = re.compile(r'\bdispatch_(?!workgroups\b)\w+\s*\(|\bwith_dispatch\s*\(|__private::enter\s*\(|matrix_checks::baseline\s*\(')
 # Qualified mod_platform:: helpers and imported helper names both match.
 # These helpers initialize before invoking user code or publishing registrations.
-READY = re.compile(r'\b(?:initialize|with_mods|install|install_parts|stick_part|install_counter|with_game|with_test_game)\s*\(')
+READY = re.compile(r'\b(?:initialize|with_mods|with_mod_parts|install|install_parts|stick_part|install_counter|with_game|with_test_game)\s*\(')
 ISOLATED = {
     'crates/horizon-mod-api/tests/late_instrumentation.rs',
     'crates/horizon-mod-api/tests/uninstalled_dispatch.rs',

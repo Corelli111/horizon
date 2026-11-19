@@ -471,6 +471,7 @@ mod block_event_queue_tests {
             block: BlockId(1),
             param_a: i,
             param_b: 0,
+            note_override: None,
         };
         let mut ticks = Ticks::new(0);
         for e in [at(1, 0), at(40, 1), at(2, 2), at(41, 3)] {
