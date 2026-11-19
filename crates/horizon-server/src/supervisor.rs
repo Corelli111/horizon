@@ -1262,6 +1262,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "daily"]
     fn the_restart_exit_code_starts_the_game_again_and_others_do_not() {
         let dir = std::env::temp_dir().join(format!("horizon-server-exit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
