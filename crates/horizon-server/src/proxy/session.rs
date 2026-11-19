@@ -2,7 +2,7 @@
 //! both ways, as it is, while the client's own settings are kept for a later login to the game (replay.rs).
 
 use super::{
-    Inner,
+    Deadline, Inner,
     auth::Profile,
     backend::{self, Backend, Identity},
     replay::{Phase, Replay, body},
@@ -19,7 +19,14 @@ use std::{
 const SILENCE: Duration = Duration::from_secs(30);
 
 /// Takes a client whose name is verified through the rest of its login and its whole play.
-pub fn run(inner: &Arc<Inner>, mut client: Connection, who: Profile, peer: IpAddr, intent: i32) {
+pub(super) fn run(
+    inner: &Arc<Inner>,
+    mut client: Connection,
+    who: Profile,
+    peer: IpAddr,
+    intent: i32,
+    deadline: Deadline,
+) {
     let identity = Identity {
         address: peer,
         uuid: who.uuid,
@@ -73,6 +80,8 @@ pub fn run(inner: &Arc<Inner>, mut client: Connection, who: Profile, peer: IpAdd
         game.writer.shutdown();
         return;
     }
+    // The client acknowledged login. The relay now has its own silence timeout.
+    drop(deadline);
     let Backend {
         reader: game_reader,
         writer: mut game_writer,

@@ -40,6 +40,7 @@ pub struct Inner {
     /// The threshold the proxy compresses its clients' connections with.
     pub compression: i32,
     keys: Option<auth::Keys>,
+    status_enabled: bool,
     /// Whether a game that answers is running: the server list asks it only then.
     up: AtomicBool,
     log: Mutex<Box<dyn Fn(&str, &str) + Send>>,
@@ -85,6 +86,13 @@ pub fn start(
         secret,
         compression: compression_threshold(config),
         keys,
+        status_enabled: config.properties.get("enable-status").is_none_or(|value| {
+            value.as_bool().unwrap_or_else(|| {
+                value
+                    .as_str()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("true"))
+            })
+        }),
         up: AtomicBool::new(false),
         log: Mutex::new(Box::new(log)),
     });
@@ -214,12 +222,13 @@ fn serve(stream: TcpStream, inner: &Arc<Inner>) -> Result<(), String> {
         .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
         .map_err(|e| e.to_string())?;
     // The timeout above is per read: this one ends the whole handshake and login.
-    let deadline = Deadline::start(&c, HANDSHAKE_TIMEOUT);
+    let deadline = Deadline::start(&c, HANDSHAKE_TIMEOUT)?;
     let e = |e: wire::Error| e.to_string();
     let (id, payload) = c.recv().map_err(e)?;
     let hello =
         handshake::decode_intention(id, &payload, handshake::PROXY_HOST_LIMIT).map_err(e)?;
     match hello.intent {
+        handshake::STATUS if !inner.status_enabled => Ok(()),
         handshake::STATUS => serve_status(&mut c, inner, hello.protocol),
         handshake::LOGIN | handshake::TRANSFER => {
             if hello.protocol != wire::PROTOCOL_VERSION {
@@ -248,8 +257,8 @@ struct Deadline {
 }
 
 impl Deadline {
-    fn start(c: &Connection, limit: Duration) -> Option<Deadline> {
-        let closer = c.reader.closer().ok()?;
+    fn start(c: &Connection, limit: Duration) -> Result<Deadline, String> {
+        let closer = c.reader.closer().map_err(|e| e.to_string())?;
         let done = Arc::new(AtomicBool::new(false));
         let flag = done.clone();
         let watcher = thread::Builder::new()
@@ -264,8 +273,8 @@ impl Deadline {
                     thread::park_timeout(left);
                 }
             })
-            .ok()?;
-        Some(Deadline {
+            .map_err(|e| e.to_string())?;
+        Ok(Deadline {
             done,
             watcher: watcher.thread().clone(),
         })
@@ -284,7 +293,7 @@ fn serve_login(
     inner: &Arc<Inner>,
     peer: IpAddr,
     intent: i32,
-    deadline: Option<Deadline>,
+    deadline: Deadline,
 ) -> Result<(), String> {
     let e = |e: wire::Error| e.to_string();
     let (id, payload) = c.recv().map_err(e)?;
@@ -297,9 +306,7 @@ fn serve_login(
     }
     match auth::profile(&mut c, inner.keys.as_ref(), &name)? {
         Ok(who) => {
-            // Logged in: the play that follows has its own silence timeout.
-            drop(deadline);
-            session::run(inner, c, who, peer, intent);
+            session::run(inner, c, who, peer, intent, deadline);
             Ok(())
         }
         Err(reason_json) => {

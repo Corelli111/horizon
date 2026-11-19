@@ -294,3 +294,39 @@ fn the_server_list_is_the_games_and_says_restarting_while_it_is_down() {
     assert!(ask().contains("fake game"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn the_proxy_keeps_the_server_list_disabled() {
+    let dir = temp_dir("status-disabled");
+    let mut config = Config::default();
+    config.server.online_mode = false;
+    config.server.bind = "127.0.0.1".into();
+    config.server.port = free_port();
+    config
+        .properties
+        .insert("enable-status".into(), false.into());
+    let proxy = start(&dir, &config, |_, _| {}).unwrap();
+    for up in [false, true] {
+        proxy.set_game_up(up);
+        let mut client =
+            Connection::connect("127.0.0.1", config.server.port, Duration::from_secs(5)).unwrap();
+        client
+            .reader
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .send(
+                &handshake::Serverbound::Intention(handshake::Intention {
+                    protocol: wire::PROTOCOL_VERSION,
+                    host: "localhost".into(),
+                    port: config.server.port,
+                    intent: handshake::STATUS,
+                })
+                .encode(),
+            )
+            .unwrap();
+        let _ = client.send(&status::Serverbound::StatusRequest(wire::Empty).encode());
+        assert!(client.recv().is_err());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

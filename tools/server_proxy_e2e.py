@@ -238,8 +238,9 @@ def wait_for(condition, what, seconds=60):
 
 
 def scenario_join(bins, folder, port, game_port):
-    motd = status_motd(port)
-    check('proxy e2e' in json.dumps(motd['description']), f'the server list through the proxy is the game\'s ({motd})')
+    wait_for(lambda: 'proxy e2e' in json.dumps(status_motd(port)['description']),
+             'the server list through the proxy to show the game\'s description')
+    check(True, 'the server list through the proxy is the game\'s')
     player = Client(port, NAME)
     player.wait_play()
     check(player.state == 'play', f'{NAME} reached play through the proxy')
