@@ -124,7 +124,7 @@ fn run() {
             );
             let traces = Arc::new(Mutex::new(Vec::new()));
             game.transactions.trace = Some(traces.clone());
-            let failures = game.wasm_dispatch_failures.get();
+            let failures = horizon_mod_runtime::dispatch_failures::dispatch_failure_generation();
             let dropped = game.dropped.len();
             for tick in 1..=2 {
                 game.world.game_time = tick;
@@ -158,7 +158,7 @@ fn run() {
                 assert_eq!(game.dropped.len(), dropped);
                 assert!(game.transactions.is_empty());
                 assert_eq!(
-                    game.wasm_dispatch_failures.get(),
+                    horizon_mod_runtime::dispatch_failures::dispatch_failure_generation(),
                     failures,
                     "nested same-guest notification must not be refused/trapped"
                 );

@@ -842,7 +842,7 @@ impl Lan {
     /// and shared state, no listener and no events of its own (the server's hub reads the network); dropping it
     /// closes nothing.
     pub fn detached(&self) -> Self {
-        let (_, events) = channel();
+        let (_, events) = event_channel();
         Self {
             shared: self.shared.clone(),
             events,

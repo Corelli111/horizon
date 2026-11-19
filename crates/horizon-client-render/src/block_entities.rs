@@ -605,7 +605,7 @@ impl BlockEntities {
             }
             unindex_chunk(&mut self.by_chunk, &pos);
             index_chunk(&mut part.by_chunk, pos);
-            forget_listed(&mut self.listed, pos);
+            forget_listed(&mut self.listed, &pos);
             note_listed(&mut part.listed, pos, Some(&entity));
             part.map.insert(pos, entity);
         }

@@ -507,11 +507,9 @@ impl Game<'_> {
         if self.regions.worker {
             return;
         }
-        if self
-            .lan
-            .as_ref()
-            .is_none_or(|host| host.hub.guests.iter().all(|g| !g.placed) && !host.hub.has_roster_others())
-        {
+        if self.lan.as_ref().is_none_or(|host| {
+            host.hub.guests.iter().all(|g| !g.placed) && !host.hub.has_roster_others()
+        }) {
             return;
         }
         self.load_scoreboard();
@@ -1420,9 +1418,9 @@ mod criterion_tests;
 #[cfg(test)]
 mod empty_tag_tests;
 #[cfg(test)]
-mod team_without_members_tests;
-#[cfg(test)]
 mod guest_advancement_tests;
+#[cfg(test)]
+mod team_without_members_tests;
 
 #[cfg(test)]
 mod source_holder_tests;

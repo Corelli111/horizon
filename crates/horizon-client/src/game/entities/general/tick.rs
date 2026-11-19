@@ -201,9 +201,9 @@ impl Game<'_> {
     fn dispatch_general_tick(&mut self, kind: &str, epoch: mod_api::WorldEpoch, id: u32) {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             mod_api::run_transaction(self, |game, _| {
-                let before = game.wasm_dispatch_failures.get();
+                let before = horizon_mod_runtime::dispatch_failures::dispatch_failure_generation();
                 game.native_general_entity_tick(kind, EntityRef::new(epoch, id));
-                (game.wasm_dispatch_failures.get() == before)
+                (horizon_mod_runtime::dispatch_failures::dispatch_failure_generation() == before)
                     .then_some(())
                     .ok_or(())
             })

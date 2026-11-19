@@ -184,7 +184,7 @@ impl Game<'_> {
         let owns_placeholder = self.world.block_entities.generation(&pos) == scope.generation
             && matches!(self.world.block_entities.get(&pos), Some(BlockEntity::Mod(entity)) if entity.id().is_empty() && entity.revision().identity() == scope.placeholder_identity);
         let valid = owns_placeholder && !scope.poisoned && scope.balanced()
-            && scope.failure_generation == self.wasm_dispatch_failures.get()
+            && scope.failure_generation == horizon_mod_runtime::dispatch_failures::dispatch_failure_generation()
             && scope.items.as_ref().is_none_or(|items| items.iter().all(|proposal| {
                 matches!(self.server_resident_entity(proposal.id), EntityLookup::Found { location, .. } if location == proposal.location)
                     && self.dropped.iter().any(|e| e.id == proposal.id && e.stack == proposal.original)

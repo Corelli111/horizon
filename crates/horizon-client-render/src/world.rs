@@ -448,6 +448,7 @@ impl World {
         let mut w = World::new(self.air, 0);
         w.shape = self.shape;
         w.fast_lava = self.fast_lava;
+        w.infiniburn.clone_from(&self.infiniburn);
         w.health_rules = self.health_rules;
         w.game_time = self.game_time;
         w.day_time = self.day_time;
@@ -478,6 +479,7 @@ impl World {
             bulk_log,
             light_log,
             attachment_syncs,
+            attachment_landings,
             ..
         } = region;
         // Each region counted its own writes from the same start: the total adds them, so no region's writes hide
@@ -509,6 +511,7 @@ impl World {
         self.block_log_held.extend(block_log_held);
         self.bulk_log.extend(bulk_log);
         self.attachment_syncs.extend(attachment_syncs);
+        self.attachment_landings.extend(attachment_landings);
         if let (Some(all), Some(log)) = (self.block_log.as_mut(), block_log) {
             all.extend(log);
         }

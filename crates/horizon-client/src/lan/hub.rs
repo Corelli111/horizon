@@ -906,8 +906,6 @@ impl Hub {
         self.guests.extend(guests);
         self.native_menu_events
             .append(&mut region.native_menu_events);
-        self.native_menu_returns
-            .append(&mut region.native_menu_returns);
         self.native_tracking.append(&mut region.native_tracking);
         self.attachment_snapshots
             .append(&mut region.attachment_snapshots);
@@ -1114,7 +1112,11 @@ impl Hub {
     }
     /// Puts this hub's placed players in the shared roster (or refreshes their entries).
     pub fn publish_roster(&self) {
-        for g in self.guests.iter().filter(|g| g.placed && g.participates_online()) {
+        for g in self
+            .guests
+            .iter()
+            .filter(|g| g.placed && g.participates_online())
+        {
             self.publish_guest(g);
         }
     }
@@ -2592,9 +2594,14 @@ impl Hub {
                 }
                 NetEvent::Packet(conn, packet, bytes) => {
                     if self.guest(conn).is_none()
-                        && matches!(&*packet, S::Chat(_) | S::ChatCommand(_) | S::ChatCommandSigned(_))
+                        && matches!(
+                            &*packet,
+                            S::Chat(_) | S::ChatCommand(_) | S::ChatCommandSigned(_)
+                        )
                     {
-                        log::warn!("dropped a chat or command packet from connection {conn}: no player in the server hub");
+                        log::warn!(
+                            "dropped a chat or command packet from connection {conn}: no player in the server hub"
+                        );
                     }
                     self.update_guest(conn, |g| {
                         g.sender.undrained.taken(bytes);
@@ -3055,7 +3062,7 @@ impl Hub {
     /// Whether an away player sent a chat message or a command: it reaches every player, so every region must be
     /// home for it (the recipients' chat chains live with their players).
     pub fn away_chat_pending(&self) -> bool {
-        self.away_events.iter().any(|e| {
+        self.away_events.iter().any(|(e, _)| {
             matches!(e, NetEvent::Packet(_, p, _) if matches!(&**p, S::Chat(_) | S::ChatCommand(_) | S::ChatCommandSigned(_)))
         })
     }

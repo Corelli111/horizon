@@ -1136,7 +1136,11 @@ impl Game<'_> {
             // the level in place after a failed switch, would report success for the wrong level.
             let owner = self.serving.as_ref().map(|s| s.owner);
             let owner_dim = self.lan.as_ref().and_then(|h| {
-                h.hub.guests.iter().find(|g| Some(g.uuid) == owner).map(|g| g.dimension.clone())
+                h.hub
+                    .guests
+                    .iter()
+                    .find(|g| Some(g.uuid) == owner)
+                    .map(|g| g.dimension.clone())
             });
             let Some(owner_dim) = owner_dim else {
                 return vec!["digest-sync: the owner is not in the world yet".to_owned()];

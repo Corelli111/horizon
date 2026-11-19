@@ -19,13 +19,13 @@ mod anger_tests;
 #[cfg(test)]
 #[path = "persist/completion_tests.rs"]
 mod completion_tests;
-#[path = "persist/passenger_graph.rs"]
-mod passenger_graph;
 #[path = "persist/hurt_by_refs.rs"]
 mod hurt_by_refs;
 #[cfg(test)]
 #[path = "persist/lookup_order_tests.rs"]
 mod lookup_order_tests;
+#[path = "persist/passenger_graph.rs"]
+mod passenger_graph;
 
 use super::{FallingBlock, Game};
 use horizon_client::{
@@ -2013,18 +2013,6 @@ impl Game<'_> {
         {
             self.score.board.entity_removed(&uuid_text(*uuid));
         }
-    }
-
-    /// The ids of every entity in the level now.
-    pub(super) fn live_entity_ids(&self) -> HashSet<u32> {
-        use super::entity::{Entity as _, entity_lists_of, for_each_entity};
-        let mut alive: HashSet<u32> = self.entity_ids_off_walk().collect();
-        // The natural fence knots a lead still holds (game/leads.rs).
-        alive.extend(self.natural_knot_ids());
-        for_each_entity!(entity_lists_of!(self), entity => {
-            alive.insert(entity.id());
-        });
-        alive
     }
 
     /// `ServerLevel.EntityCallbacks.onDestroyed` → `Scoreboard.entityRemoved`

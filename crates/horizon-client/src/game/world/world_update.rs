@@ -227,7 +227,9 @@ impl Game<'_> {
         let (uploads, unloaded) = horizon_client::spans::time("streaming", || {
             self.streaming.complete_commit(&mut self.world, commit)
         });
-        self.regions.prof.add(super::region_profile::Step::StreamUpdate, timing);
+        self.regions
+            .prof
+            .add(super::region_profile::Step::StreamUpdate, timing);
         self.streaming.extra.truncate(areas);
         // The viewed levels' meshing, queued after the player's level's (nothing while no view
         // names one).
@@ -246,7 +248,9 @@ impl Game<'_> {
             .collect();
         let timing = Instant::now();
         let modified = horizon_client::spans::time("with_entities", || self.with_entities(&dirty));
-        self.regions.prof.add(super::region_profile::Step::StreamEntities, timing);
+        self.regions
+            .prof
+            .add(super::region_profile::Step::StreamEntities, timing);
         self.native_full_chunk_snapshots(&modified);
         if !modified.is_empty()
             && let Err(e) = horizon_client::spans::time("save_chunks", || {

@@ -17,7 +17,7 @@
 use super::region_profile::Step;
 use super::{Dim, Game, Mob, Resources};
 use horizon_client::Result;
-use horizon_client::join_seq::JoinList;
+use horizon_client::join_seq::{JoinList, Joined, ResidentList};
 use horizon_core::fast_hash::FxHashMap;
 use horizon_core::position::ChunkPos;
 use std::collections::HashMap;
@@ -352,9 +352,15 @@ struct Slot {
     /// The connections of its players.
     conns: Vec<u32>,
     /// Its players as native mods see them (`native_server_players`), as of the last time the region was home.
-    players: Vec<(u32, u128)>,
+    players: Vec<AwayPlayer>,
     /// Its players' sleep counts as it last reported them.
     sleep: (i64, i64, i64),
+}
+
+pub(super) struct AwayPlayer {
+    pub id: u32,
+    pub uuid: u128,
+    pub sender: horizon_client::lan::PlayerSender,
 }
 
 impl Slot {
@@ -604,26 +610,28 @@ impl Game<'_> {
         w.block_ticks = part.ticks;
         w.random_tick_sections = part.sections;
         w.rand_sequences = part.sequences;
-        w.mobs = part.mobs.into();
+        w.mobs.extend(part.mobs);
         w.creaking.lend_scanned(part.scanned);
-        w.dropped = part.dropped.into();
-        w.orbs = part.orbs.into();
-        w.creatures.projectiles = part.projectiles.into();
-        w.falling = part.falling.into();
-        w.paintings = part.paintings;
-        w.item_frames = part.item_frames;
-        w.armor_stands = part.armor_stands.into();
-        w.cushions = part.cushions;
-        w.others = part.others;
-        w.boats = part.boats.into();
-        w.carts = part.carts.into();
+        w.dropped.extend(part.dropped);
+        w.orbs.extend(part.orbs);
+        w.creatures.projectiles.extend(part.projectiles);
+        w.falling.extend(part.falling);
+        w.paintings.extend(part.paintings);
+        w.item_frames.extend(part.item_frames);
+        w.armor_stands.extend(part.armor_stands);
+        w.cushions.extend(part.cushions);
+        w.others.append(&mut part.others.into_iter().collect());
+        w.boats.extend(part.boats);
+        w.carts.extend(part.carts);
         w.bolts = part.bolts;
-        w.crystals = part.crystals;
-        w.breath_clouds = part.breath_clouds;
-        w.tridents = part.tridents.into();
-        w.rockets = part.rockets.into();
-        w.ominous_spawners = part.ominous_spawners;
-        w.tnts = part.tnts.into();
+        w.crystals.extend(part.crystals);
+        w.breath_clouds
+            .append(&mut part.breath_clouds.into_iter().collect());
+        w.tridents.extend(part.tridents);
+        w.rockets.extend(part.rockets);
+        w.ominous_spawners
+            .append(&mut part.ominous_spawners.into_iter().collect());
+        w.tnts.extend(part.tnts);
         w.hoppers = part.hoppers;
         w.jukebox_sounds = part.jukebox_sounds;
         w.lid_openers = part.lid_openers;
@@ -660,11 +668,11 @@ impl Game<'_> {
         ids.extend(w.cushions.iter().map(|c| c.id));
         ids.extend(w.others.iter().map(|o| o.id));
         for id in ids {
+            if let Some(attached) = self.entity_attachments.remove(&id) {
+                w.entity_attachments.insert(id, attached);
+            }
             if let Some(u) = self.persist.uuids.remove(&id) {
                 w.persist.uuids.insert(id, u);
-                if let Some(attached) = self.entity_attachments.remove(&u) {
-                    w.entity_attachments.insert(u, attached);
-                }
             }
             if let Some(t) = self.persist.raw.remove(&id) {
                 w.persist.raw.insert(id, t);
@@ -721,29 +729,28 @@ impl Game<'_> {
                 std::panic::resume_unwind(e);
             }
         });
-        append_all(&mut self.mobs, drain(&mut w.mobs));
+        self.mobs.append(&mut w.mobs);
         self.creaking.take_scanned_back(&mut w.creaking);
-        append_all(&mut self.dropped, drain(&mut w.dropped));
-        append_all(&mut self.orbs, drain(&mut w.orbs));
-        append_all(
-            &mut self.creatures.projectiles,
-            drain(&mut w.creatures.projectiles),
-        );
-        append_all(&mut self.falling, drain(&mut w.falling));
+        self.dropped.append(&mut w.dropped);
+        self.orbs.append(&mut w.orbs);
+        self.creatures
+            .projectiles
+            .append(&mut w.creatures.projectiles);
+        self.falling.append(&mut w.falling);
         self.paintings.append(&mut w.paintings);
         self.item_frames.append(&mut w.item_frames);
-        append_all(&mut self.armor_stands, drain(&mut w.armor_stands));
+        self.armor_stands.append(&mut w.armor_stands);
         self.cushions.append(&mut w.cushions);
         self.others.append(&mut w.others);
-        append_all(&mut self.boats, drain(&mut w.boats));
-        append_all(&mut self.carts, drain(&mut w.carts));
+        self.boats.append(&mut w.boats);
+        self.carts.append(&mut w.carts);
         self.bolts.append(&mut w.bolts);
         self.crystals.append(&mut w.crystals);
         self.breath_clouds.append(&mut w.breath_clouds);
-        append_all(&mut self.tridents, drain(&mut w.tridents));
-        append_all(&mut self.rockets, drain(&mut w.rockets));
+        self.tridents.append(&mut w.tridents);
+        self.rockets.append(&mut w.rockets);
         self.ominous_spawners.append(&mut w.ominous_spawners);
-        append_all(&mut self.tnts, drain(&mut w.tnts));
+        self.tnts.append(&mut w.tnts);
         self.hoppers.extend(w.hoppers.drain());
         self.jukebox_sounds.extend(w.jukebox_sounds.drain());
         self.lid_openers.extend(w.lid_openers.drain());
@@ -759,7 +766,7 @@ impl Game<'_> {
         a.pots.extend(b.pots.drain());
         a.gateway_servers.extend(b.gateway_servers.drain());
         a.conduit_servers.extend(b.conduit_servers.drain());
-        self.persist.uuids.extend(w.persist.uuids.drain());
+        self.persist.uuids.append(&mut w.persist.uuids);
         self.persist.raw.extend(w.persist.raw.drain());
         self.persist
             .passenger_slots
@@ -1291,8 +1298,12 @@ impl Game<'_> {
                         .hub
                         .guests
                         .iter()
-                        .filter(|g| g.placed)
-                        .map(|g| (g.entity_id as u32, g.uuid))
+                        .filter(|g| g.placed && g.participates_online())
+                        .map(|g| AwayPlayer {
+                            id: g.entity_id as u32,
+                            uuid: g.uuid,
+                            sender: g.sender.clone(),
+                        })
                         .collect();
                 }
             }
@@ -1603,14 +1614,13 @@ impl Game<'_> {
     }
 
     /// The players native mods can see: those away in a resident region, as it last reported them.
-    pub(super) fn away_server_players(&self) -> Vec<(u32, u128)> {
+    pub(super) fn away_server_players(&self) -> impl Iterator<Item = &AwayPlayer> {
         self.regions
             .resident
             .values()
             .chain(self.regions.flight.iter().map(|(_, f)| &f.set))
             .flat_map(|set| set.games.iter().filter(|s| !s.landed))
-            .flat_map(|s| s.players.iter().cloned())
-            .collect()
+            .flat_map(|s| s.players.iter())
     }
 
     /// Queues `packet` for a player away in a region, for its next tick; false when `uuid` is not away.
@@ -1621,17 +1631,7 @@ impl Game<'_> {
         packet: horizon_protocol::packets::play::Clientbound,
         horizon_only: bool,
     ) -> bool {
-        // Regions resting between ticks and regions started early this tick (in `flight`) alike.
-        let away = self
-            .regions
-            .resident
-            .values()
-            .chain(self.regions.flight.iter().map(|(_, f)| &f.set))
-            .any(|set| {
-                set.games
-                    .iter()
-                    .any(|s| !s.landed && s.players.iter().any(|p| p.1 == uuid))
-            });
+        let away = self.away_server_players().any(|player| player.uuid == uuid);
         if away {
             // Never dropped: they wait for the region's next tick or for its landing.
             self.regions.away_out.push((uuid, packet, horizon_only));
@@ -1859,27 +1859,26 @@ fn split<T>(v: &mut Vec<T>, regions: &Regions, at: impl Fn(&T) -> (f64, f64)) ->
     out
 }
 
-/// `v`'s entities at the end of `list`, as they are (they joined a level already: their order is kept).
-fn append_all<T>(list: &mut JoinList<T>, mut v: Vec<T>) {
-    list.append(&mut v);
-}
-
-/// A list of entities as a plain vector, the list left empty.
-fn drain<T>(list: &mut JoinList<T>) -> Vec<T> {
-    std::mem::take(list).into()
-}
-
-/// [`split`] for a level's list of entities: what no region owns stays in `list`. (Splitting a drained copy
-/// would drop every entity outside the regions' sections along with it: the chunks they stand in are saved
-/// without them.)
-fn split_list<T>(
-    list: &mut JoinList<T>,
+/// Split a joined list without replacing the list's residency binding.
+fn split_list<T: Joined, const DIRECT: bool>(
+    list: &mut JoinList<T, DIRECT>,
     regions: &Regions,
     at: impl Fn(&T) -> (f64, f64),
 ) -> Vec<Vec<T>> {
-    let mut all = drain(list);
+    let mut all = list.drain(..).collect();
     let out = split(&mut all, regions, at);
-    *list = all.into();
+    list.extend(all);
+    out
+}
+
+fn split_resident<T: Joined>(
+    list: &mut ResidentList<T>,
+    regions: &Regions,
+    at: impl Fn(&T) -> (f64, f64),
+) -> Vec<Vec<T>> {
+    let mut all = list.drain(..).collect();
+    let out = split(&mut all, regions, at);
+    list.append(&mut all.into_iter().collect());
     out
 }
 
@@ -2011,19 +2010,20 @@ impl Game<'_> {
                 |p| v3(&p.position),
             );
         let mut falling = split_list(&mut self.falling, regions, |f| v3(&f.position));
-        let mut paintings = split(&mut self.paintings, regions, |p| b3(&p.pos));
-        let mut item_frames = split(&mut self.item_frames, regions, |f| b3(&f.pos));
+        let mut paintings = split_list(&mut self.paintings, regions, |p| b3(&p.pos));
+        let mut item_frames = split_list(&mut self.item_frames, regions, |f| b3(&f.pos));
         let mut armor_stands = split_list(&mut self.armor_stands, regions, |s| v3(&s.position));
-        let mut cushions = split(&mut self.cushions, regions, |c| v3(&c.position));
-        let mut others = split(&mut self.others, regions, |o| v3(&o.position));
+        let mut cushions = split_list(&mut self.cushions, regions, |c| v3(&c.position));
+        let mut others = split_resident(&mut self.others, regions, |o| v3(&o.position));
         let mut boats = split_list(&mut self.boats, regions, |b| v3(&b.position));
         let mut carts = split_list(&mut self.carts, regions, |c| v3(&c.position));
         let mut bolts = split(&mut self.bolts, regions, |b| a3(&b.at));
-        let mut crystals = split(&mut self.crystals, regions, |c| v3(&c.position));
-        let mut breath_clouds = split(&mut self.breath_clouds, regions, |b| a3(&b.at));
+        let mut crystals = split_list(&mut self.crystals, regions, |c| v3(&c.position));
+        let mut breath_clouds = split_resident(&mut self.breath_clouds, regions, |b| a3(&b.at));
         let mut tridents = split_list(&mut self.tridents, regions, |t| v3(&t.position));
         let mut rockets = split_list(&mut self.rockets, regions, |r| v3(&r.position));
-        let mut ominous_spawners = split(&mut self.ominous_spawners, regions, |o| a3(&o.position));
+        let mut ominous_spawners =
+            split_resident(&mut self.ominous_spawners, regions, |o| a3(&o.position));
         let mut tnts = split_list(&mut self.tnts, regions, |t| v3(&t.position));
         let mut hoppers = split_map(&mut self.hoppers, regions, |p| block_chunk(*p));
         let mut jukebox_sounds = split_map(&mut self.jukebox_sounds, regions, |p| block_chunk(*p));
@@ -2166,13 +2166,26 @@ mod tests {
     fn splitting_a_list_keeps_what_no_region_owns() {
         // One region around chunk 0 (blocks -64..128); the entity at x = 1000 stands in no region's chunks.
         let regions = Regions::new([(0, 0)], &[(0, 0)], 0);
-        let mut mobs: JoinList<(u32, f64)> = vec![(1, 5.0), (2, 1000.0), (3, 20.0)].into();
-        let parts = split_list(&mut mobs, &regions, |m| (m.1, 0.0));
+        struct TestEntity {
+            id: u32,
+            x: f64,
+            join: horizon_client::join_seq::JoinSeq,
+        }
+        horizon_client::impl_joined!(TestEntity);
+        let mut mobs: JoinList<_> = [(1, 5.0), (2, 1000.0), (3, 20.0)]
+            .into_iter()
+            .map(|(id, x)| TestEntity {
+                id,
+                x,
+                join: Default::default(),
+            })
+            .collect();
+        let parts = split_list(&mut mobs, &regions, |m| (m.x, 0.0));
         assert_eq!(parts.len(), 1);
-        let lent: Vec<u32> = parts[0].iter().map(|m| m.0).collect();
+        let lent: Vec<u32> = parts[0].iter().map(|m| m.id).collect();
         assert_eq!(lent, [1, 3]);
         // The level keeps the far entity: a save of its chunk still writes it.
-        let kept: Vec<u32> = mobs.iter().map(|m| m.0).collect();
+        let kept: Vec<u32> = mobs.iter().map(|m| m.id).collect();
         assert_eq!(kept, [2]);
     }
 }

@@ -1145,8 +1145,11 @@ impl Game<'_> {
                     g.uuid,
                 )
             })
-            .chain(self.away_server_players().into_iter().map(|(id, uuid)| {
-                mod_api::__private::game::player_ref(mod_api::EntityRef::new(epoch, id), uuid)
+            .chain(self.away_server_players().map(|player| {
+                mod_api::__private::game::player_ref(
+                    mod_api::EntityRef::new(epoch, player.id),
+                    player.uuid,
+                )
             }))
             .collect()
     }
@@ -2435,7 +2438,10 @@ mod tests {
         ));
         let plain = ItemStack::new("minecraft:stick", 5);
         assert_eq!(api_stack_or_keep(Some(unknown.clone()), &mut kept), None);
-        assert_eq!(api_stack_or_keep(Some(odd_components.clone()), &mut kept), None);
+        assert_eq!(
+            api_stack_or_keep(Some(odd_components.clone()), &mut kept),
+            None
+        );
         assert_eq!(api_stack_or_keep(None, &mut kept), None);
         assert_eq!(
             api_stack_or_keep(Some(plain.clone()), &mut kept),

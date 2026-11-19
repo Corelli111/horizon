@@ -351,7 +351,13 @@ impl ChunkMap {
         regions: usize,
         region_of: impl Fn(Key) -> Option<usize>,
     ) -> Vec<ChunkMap> {
-        let mut out: Vec<ChunkMap> = (0..regions).map(|_| ChunkMap::default()).collect();
+        let mut out: Vec<ChunkMap> = (0..regions)
+            .map(|_| {
+                let mut part = ChunkMap::default();
+                part.attachment_observer = self.attachment_observer.clone();
+                part
+            })
+            .collect();
         for (key, chunk) in self.columns.extract_if(|key, _| region_of(*key).is_some()) {
             let r = region_of(key).expect("extracted for its region");
             if self.fresh.remove(&key) {
@@ -367,10 +373,16 @@ impl ChunkMap {
         out
     }
     /// The chunks [`ChunkMap::lend`] lent, back (a region's tick never loads or drops a chunk).
-    pub fn take_back(&mut self, lent: ChunkMap) {
-        self.fresh.extend(lent.fresh);
-        self.columns.reserve(lent.columns.len());
-        self.columns.extend(lent.columns);
+    pub fn take_back(&mut self, mut lent: ChunkMap) {
+        if lent.touched_all != 0 || lent.touched_base != 0 {
+            self.touch_all();
+        } else {
+            for key in lent.touched.drain(..) {
+                self.touch(key);
+            }
+        }
+        self.fresh.extend(lent.fresh.drain());
+        self.columns.extend(lent.columns.drain());
     }
     pub fn values_mut(&mut self) -> ValuesMut<'_, Key, Arc<Chunk>> {
         self.touch_all();
