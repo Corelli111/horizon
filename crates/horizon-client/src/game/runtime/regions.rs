@@ -544,6 +544,8 @@ impl Game<'_> {
         self.world_debug = from.world_debug;
         // The server's tables, shared: building them reads every item and recipe file from disk.
         self.world_tables = from.world_tables.clone();
+        self.server_loot = from.server_loot.clone();
+        self.server_items.clone_from(&from.server_items);
         self.share_spawn_conditions();
         self.copy_tick_settings_from(from);
         self.lend_scoreboard_from(from);
@@ -1741,7 +1743,7 @@ impl Game<'_> {
         }
         let dims: Vec<Dim> = self.regions.resident.keys().copied().collect();
         for dim in dims {
-            if dim != self.dim && self.enter_level(None, dim).is_err() {
+            if dim != self.dim && self.enter_level(dim).is_err() {
                 continue;
             }
             if let Some(set) = self.regions.resident.remove(&dim) {
@@ -1749,7 +1751,7 @@ impl Game<'_> {
             }
         }
         if self.dim != home {
-            let _ = self.enter_level(None, home);
+            let _ = self.enter_level(home);
         }
     }
 

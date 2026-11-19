@@ -870,10 +870,10 @@ impl Hub {
     ) -> Vec<Vec<Guest>> {
         let mut out: Vec<Vec<Guest>> = (0..regions).map(|_| Vec::new()).collect();
         let mut kept = Vec::with_capacity(self.guests.len());
-        for g in std::mem::take(&mut self.guests) {
+        for g in self.guests.take_rows() {
             match region_of(g.conn) {
                 Some(r) if r < regions => {
-                    if g.placed && !g.fake && !self.lan.shared.roster_has(g.conn) {
+                    if g.placed && g.participates_online() && !self.lan.shared.roster_has(g.conn) {
                         self.publish_guest(&g);
                     }
                     self.lan
@@ -884,25 +884,26 @@ impl Hub {
                 _ => kept.push(g),
             }
         }
-        self.guests = kept;
+        self.guests.extend(kept);
         out
     }
 
     /// The guests in connection order again after regions gave theirs back ([`Hub::take_guests_back`] only
     /// appends).
     pub fn restore_guest_order(&mut self) {
-        self.guests.sort_by_key(|g| g.conn);
+        self.guests.sort_by_connection();
     }
 
     /// A region hub's guests back, with what its tick left for this hub.
     pub fn take_guests_back(&mut self, region: &mut Hub) {
         // What the server sent their clients of the scoreboard meanwhile.
-        for g in &mut region.guests {
+        let mut guests = region.guests.take_rows();
+        for g in &mut guests {
             if let Some(view) = self.lan.shared.roster_return_scoreboard(g.conn) {
                 g.scoreboard = view;
             }
         }
-        self.guests.append(&mut region.guests);
+        self.guests.extend(guests);
         self.native_menu_events
             .append(&mut region.native_menu_events);
         self.native_menu_returns
@@ -1113,7 +1114,7 @@ impl Hub {
     }
     /// Puts this hub's placed players in the shared roster (or refreshes their entries).
     pub fn publish_roster(&self) {
-        for g in self.guests.iter().filter(|g| g.placed && !g.fake) {
+        for g in self.guests.iter().filter(|g| g.placed && g.participates_online()) {
             self.publish_guest(g);
         }
     }
@@ -2547,11 +2548,18 @@ impl Hub {
         self.expire_arrivals(&mut events);
         let mut credits = Vec::new();
         let mut polled = std::mem::take(&mut self.replay);
-        polled.extend(self.lan.poll().into_iter().map(|receipt| receipt.into_parts()));
+        polled.extend(
+            self.lan
+                .poll()
+                .into_iter()
+                .map(|receipt| receipt.into_parts()),
+        );
         for (event, credit) in polled {
             let for_away = match &event {
                 NetEvent::Packet(conn, ..) | NetEvent::Left(conn, _) => self.away.contains(conn),
-                NetEvent::RawPayload(delivery) => delivery.conn.is_some_and(|conn| self.away.contains(&conn)),
+                NetEvent::RawPayload(delivery) => {
+                    delivery.conn.is_some_and(|conn| self.away.contains(&conn))
+                }
                 NetEvent::Duplicate(_) => !self.away.is_empty(),
                 NetEvent::Joined(_) => false,
             };
@@ -2583,6 +2591,11 @@ impl Hub {
                     }
                 }
                 NetEvent::Packet(conn, packet, bytes) => {
+                    if self.guest(conn).is_none()
+                        && matches!(&*packet, S::Chat(_) | S::ChatCommand(_) | S::ChatCommandSigned(_))
+                    {
+                        log::warn!("dropped a chat or command packet from connection {conn}: no player in the server hub");
+                    }
                     self.update_guest(conn, |g| {
                         g.sender.undrained.taken(bytes);
                         if g.left_reason.is_empty() {
@@ -2754,7 +2767,7 @@ impl Hub {
             || self
                 .guests
                 .iter()
-                .any(|g| g.placed && !g.fake && !self.lan.shared.roster_has(g.conn))
+                .any(|g| g.placed && g.participates_online() && !self.lan.shared.roster_has(g.conn))
         {
             self.publish_roster();
         }
@@ -3034,7 +3047,9 @@ impl Hub {
     /// Whether something an away player's connection sent has to be seen by the server's thread: a leave, a
     /// duplicate login, or a packet that reaches past its region.
     pub fn away_wants_server(&self) -> bool {
-        self.away_events.iter().any(|(event, _)| !matches!(event, NetEvent::Packet(_, p, _) if region_local(p)))
+        self.away_events
+            .iter()
+            .any(|(event, _)| !matches!(event, NetEvent::Packet(_, p, _) if region_local(p)))
     }
 
     /// Whether an away player sent a chat message or a command: it reaches every player, so every region must be
@@ -3057,7 +3072,11 @@ impl Hub {
         let (mut given, mut kept) = (Vec::new(), Vec::new());
         for e in std::mem::take(&mut self.away_events) {
             match &e.0 {
-                NetEvent::Packet(conn, p, _) if mine.contains(conn) && !blocked.contains(conn) && region_local(p) => given.push(e),
+                NetEvent::Packet(conn, p, _)
+                    if mine.contains(conn) && !blocked.contains(conn) && region_local(p) =>
+                {
+                    given.push(e)
+                }
                 NetEvent::Packet(conn, ..) | NetEvent::Left(conn, _) => {
                     if mine.contains(conn) {
                         blocked.insert(*conn);
@@ -3077,12 +3096,15 @@ impl Hub {
         }
         self.away_events = kept;
         for (event, credit) in given {
-            if let NetEvent::Packet(conn, packet, bytes) = event
-                && let Some(g) = region.guest_mut(conn)
-                && g.left_reason.is_empty()
-            {
-                g.sender.undrained.taken(bytes);
-                g.inbox.push_back(InboxItem::Packet(*packet, Some(credit)));
+            if let NetEvent::Packet(conn, packet, bytes) = event {
+                region.update_guest(conn, |guest| {
+                    guest.sender.undrained.taken(bytes);
+                    if guest.left_reason.is_empty() {
+                        guest
+                            .inbox
+                            .push_back(InboxItem::Packet(*packet, Some(credit)));
+                    }
+                });
             }
         }
     }
@@ -3091,8 +3113,8 @@ impl Hub {
     /// connection (a duplicate login).
     pub fn away_server_conns(&self) -> Option<Vec<u32>> {
         let mut out = Vec::new();
-        for e in &self.away_events {
-            match e {
+        for (event, _) in &self.away_events {
+            match event {
                 NetEvent::Packet(_, p, _) if region_local(p) => {}
                 NetEvent::Packet(conn, ..) | NetEvent::Left(conn, _) => {
                     if !out.contains(conn) {
@@ -3110,9 +3132,15 @@ impl Hub {
         for c in conns {
             self.away.remove(c);
         }
-        let (mine, kept): (Vec<NetEvent>, Vec<NetEvent>) = std::mem::take(&mut self.away_events)
+        let (mine, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.away_events)
             .into_iter()
-            .partition(|e| matches!(e, NetEvent::Packet(c, ..) | NetEvent::Left(c, _) if conns.contains(c)));
+            .partition(|(event, _)| match event {
+                NetEvent::Packet(conn, ..) | NetEvent::Left(conn, _) => conns.contains(conn),
+                NetEvent::RawPayload(delivery) => {
+                    delivery.conn.is_some_and(|conn| conns.contains(&conn))
+                }
+                _ => false,
+            });
         self.away_events = kept;
         self.replay.extend(mine);
         // A duplicate login belongs to no connection: it waits for the last region to be home.
@@ -3136,7 +3164,7 @@ impl Hub {
         for i in 0..self.guests.len() {
             if self.watches(&self.guests[i]) {
                 self.update_view(i, watching);
-                if let Some(batch) = self.next_batch(i, world, ctx.streaming) {
+                if let Some(batch) = self.next_batch(i, world, streaming) {
                     batches.push((i, batch));
                 }
             }

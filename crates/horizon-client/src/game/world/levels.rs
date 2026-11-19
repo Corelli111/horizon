@@ -1423,6 +1423,7 @@ impl Game<'_> {
     pub(super) fn tick_first_level(&mut self) -> Result<()> {
         // Only a server ticks its own world from here: its players are guests, swapped in for
         // their turns (`as_guest`), and the window's player is a client of it.
+        let began = Instant::now();
         self.ticks += 1;
         self.repro_tick();
         let window = !self.is_logical_server();
@@ -1494,6 +1495,7 @@ impl Game<'_> {
         self.tick_totem();
         self.update_totem_ready();
         span("tick_command_extras", || self.tick_command_extras());
+        self.regions.prof.add(super::region_profile::Step::Prelude, began);
         self.tick_world(running)
     }
 

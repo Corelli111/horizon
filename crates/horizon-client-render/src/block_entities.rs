@@ -539,15 +539,18 @@ impl BlockEntities {
         region_of: impl Fn(Pos) -> Option<usize>,
     ) -> Vec<BlockEntities> {
         let mut out: Vec<BlockEntities> = (0..regions)
-            .map(|_| BlockEntities {
-                states: self.states.clone(),
-                stateful_entities: self.stateful_entities.clone(),
-                mod_containers: self.mod_containers.clone(),
-                mod_fluids: self.mod_fluids.clone(),
-                mod_energy: self.mod_energy.clone(),
-                next_slot: self.next_slot,
-                journal: Some(Vec::new()),
-                ..Default::default()
+            .map(|_| {
+                let mut part = BlockEntities::default();
+                part.states = self.states.clone();
+                part.stateful_entities = self.stateful_entities.clone();
+                part.mod_containers = self.mod_containers.clone();
+                part.mod_fluids = self.mod_fluids.clone();
+                part.mod_energy = self.mod_energy.clone();
+                part.attachment_observer = self.attachment_observer.clone();
+                part.on_load_enabled = self.on_load_enabled;
+                part.next_slot = self.next_slot;
+                part.journal = Some(Vec::new());
+                part
             })
             .collect();
         // Each region's share of the ticking list, in the list's order: without it a region's ticks would find
@@ -593,7 +596,31 @@ impl BlockEntities {
             if let Some(attached) = self.attachments.remove(&pos) {
                 out[r].attachments.insert(pos, attached);
             }
-            out[r].map.insert(pos, entity);
+            let part = &mut out[r];
+            if let Some(generation) = self.generations.remove(&pos) {
+                part.generations.insert(pos, generation);
+            }
+            if let Some(snapshot) = self.client_snapshots.remove(&pos) {
+                part.client_snapshots.insert(pos, snapshot);
+            }
+            unindex_chunk(&mut self.by_chunk, &pos);
+            index_chunk(&mut part.by_chunk, pos);
+            forget_listed(&mut self.listed, pos);
+            note_listed(&mut part.listed, pos, Some(&entity));
+            part.map.insert(pos, entity);
+        }
+        self.on_load.retain(|&(pos, generation)| {
+            if let Some(r) = region_of(pos).filter(|&r| r < regions) {
+                out[r].on_load.push_back((pos, generation));
+                false
+            } else {
+                true
+            }
+        });
+        for (pos, carried) in self.carried.extract_if(|pos, _| region_of(*pos).is_some()) {
+            out[region_of(pos).expect("extracted for its region")]
+                .carried
+                .insert(pos, carried);
         }
         for pos in self
             .asleep
@@ -647,34 +674,32 @@ impl BlockEntities {
 
     /// A region's set from [`BlockEntities::lend`] back: its block entities and what is kept by their position,
     /// and the slots its ticks made and freed, in the order they did.
-    pub fn take_back(&mut self, region: BlockEntities) {
-        let BlockEntities {
-            map,
-            attachments,
-            out,
-            replaced,
-            asleep,
-            boxes,
-            sign_editors,
-            mods,
-            journal,
-            borrowed,
-            ..
-        } = region;
-        for pos in &borrowed {
-            self.lent.remove(pos);
+    pub fn take_back(&mut self, mut region: BlockEntities) {
+        for pos in region.borrowed.drain(..) {
+            self.lent.remove(&pos);
         }
-        self.map.reserve(map.len());
-        self.map.extend(map);
-        self.attachments.extend(attachments);
-        self.out.extend(out);
-        self.replaced.extend(replaced);
-        self.asleep.extend(asleep);
-        self.boxes.extend(boxes);
-        self.sign_editors.extend(sign_editors);
-        for (chunk, set) in mods {
+        self.map.extend(region.map.drain());
+        self.generations.extend(region.generations.drain());
+        self.attachments.extend(region.attachments.drain());
+        self.on_load.append(&mut region.on_load);
+        self.out.extend(region.out.drain());
+        self.replaced.extend(region.replaced.drain());
+        self.asleep.extend(region.asleep.drain());
+        self.boxes.extend(region.boxes.drain());
+        self.sign_editors.extend(region.sign_editors.drain());
+        self.carried.extend(region.carried.drain());
+        self.client_snapshots
+            .extend(region.client_snapshots.drain());
+        for (all, part) in self.listed.iter_mut().zip(&mut region.listed) {
+            all.extend(part.drain());
+        }
+        for (chunk, positions) in region.by_chunk.drain() {
+            self.by_chunk.entry(chunk).or_default().extend(positions);
+        }
+        for (chunk, set) in region.mods.drain() {
             self.mods.entry(chunk).or_default().extend(set);
         }
+        let journal = region.journal.take();
         for (pos, made) in journal.unwrap_or_default() {
             if made {
                 self.add(pos);

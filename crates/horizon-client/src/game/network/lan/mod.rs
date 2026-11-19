@@ -113,6 +113,7 @@ impl LanHost {
             players_told_left: false,
             settings: self.settings,
             play: HashMap::new(),
+            menus: HashMap::new(),
             broken: Vec::new(),
             mob_state: HashMap::new(),
             poses: HashMap::new(),
@@ -124,8 +125,7 @@ impl LanHost {
             commands: Vec::new(),
             quiet: Default::default(),
             far: None,
-            native_commands: self.native_commands.clone(),
-            native_usages: Vec::new(),
+            native_commands_sent: self.native_commands_sent,
             sleep_ignored: Default::default(),
             states: Default::default(),
             states_next_entity: None,
@@ -145,12 +145,15 @@ impl LanHost {
         guests: Vec<horizon_client::lan::guest::Guest>,
     ) {
         r.hub.copy_region_settings(&self.hub);
-        r.native_commands = self.native_commands.clone();
+        r.native_commands_sent = self.native_commands_sent;
         r.sleep_ignored = self.sleep_ignored.clone();
-        r.hub.guests = guests;
+        r.hub.guests.extend(guests);
         for conn in conns {
             if let Some(p) = self.play.remove(conn) {
                 r.play.insert(*conn, p);
+            }
+            if let Some(menus) = self.menus.remove(conn) {
+                r.menus.insert(*conn, menus);
             }
             if let Some(p) = self.poses.remove(conn) {
                 r.poses.insert(*conn, p);
@@ -173,6 +176,7 @@ impl LanHost {
     pub(super) fn take_region_back(&mut self, r: &mut LanHost) {
         self.hub.take_guests_back(&mut r.hub);
         self.play.extend(r.play.drain());
+        self.menus.extend(r.menus.drain());
         self.poses.extend(r.poses.drain());
         self.mob_players.extend(r.mob_players.drain());
         for (dim, states) in r.mob_state.iter_mut() {
