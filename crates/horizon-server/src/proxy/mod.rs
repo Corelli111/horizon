@@ -13,7 +13,7 @@ mod replay;
 mod session;
 mod wire;
 
-use crate::config::Config;
+use horizon_server_launch::config::Config;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
@@ -55,16 +55,6 @@ impl Inner {
 #[derive(Clone)]
 pub struct Proxy {
     inner: Arc<Inner>,
-}
-
-/// What the game is told so it listens where only the proxy goes: `server.properties` keys.
-pub fn game_properties(game_port: u16) -> Vec<(String, String)> {
-    vec![
-        ("server-ip".to_owned(), "127.0.0.1".to_owned()),
-        ("server-port".to_owned(), game_port.to_string()),
-        // The proxy has signed the player in: the game trusts what it forwards (online-mode=false).
-        ("online-mode".to_owned(), "false".to_owned()),
-    ]
 }
 
 /// Starts listening on the public address. `dir` is the server folder; `log` receives (level, line).
@@ -375,15 +365,6 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&restarting_status(777)).unwrap();
         assert_eq!(v["description"]["translate"], "horizon.proxy.restarting");
         assert_eq!(v["version"]["protocol"], 777);
-    }
-
-    #[test]
-    fn the_game_listens_only_for_the_proxy_and_trusts_what_it_forwards() {
-        let p = game_properties(25599);
-        let get = |k: &str| p.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
-        assert_eq!(get("server-ip"), Some("127.0.0.1"));
-        assert_eq!(get("server-port"), Some("25599"));
-        assert_eq!(get("online-mode"), Some("false"));
     }
 
     #[test]

@@ -21,6 +21,9 @@ struct WorldTarget {
     depth: wgpu::TextureView,
     group: wgpu::BindGroup,
     taa: Option<History>,
+    /// The world anti-aliased at its own size, made on first use (`resolved`); `Some(None)`
+    /// where there was no video memory for it, until the target is made again.
+    resolved: Option<Option<wgpu::TextureView>>,
 }
 
 /// TAA's two history textures at the output size (the world's, times the upscale), written
@@ -162,7 +165,10 @@ pub struct Post {
     /// Output pixels per rendered pixel while TAA is on (1: native): the world renders
     /// this much smaller and TAA rebuilds it at the resolution scale's size.
     pub upscale: f32,
-    /// TAA runs this frame (`jitter`): not on the title screen or under a shader pack.
+    /// `upscale` is held at 1 (`hold_upscale`): a native pack's world gets TAA at its own size.
+    upscale_held: bool,
+    /// TAA runs this frame (`jitter`): not on the title screen, under a `shaders/` pack, or
+    /// under a native one the renderer doesn't resolve (`Capabilities::engine_resolve`).
     taa_on: bool,
     target: Option<WorldTarget>,
     taa_resources: Option<TaaResources>,
@@ -171,7 +177,25 @@ pub struct Post {
     /// The last TAA frame's unjittered `view_proj` and camera, `None` once a frame ran without it.
     taa_previous: Option<(DMat4, DVec3)>,
     taa_this_frame: TaaUniform,
-    light_key: Option<(bool, [f32; 4], [f32; 4], [[f32; 4]; 2])>,
+    light_key: Option<LightKey>,
+}
+
+/// What the colour TAA's history keeps was drawn under: a change makes the history unusable.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum LightKey {
+    /// No pack: HDR's gain bakes `settings` into the colour (`[0; 4]` without it).
+    Engine { gain: bool, settings: [f32; 4] },
+    /// A native (API 0.2) pack's frame, lit for the display its `Frame` describes.
+    Pack(super::output::DisplayValues),
+}
+
+impl LightKey {
+    /// A frame without a pack. Without gain the settings don't change the colour: the
+    /// history stays through a change of them alone.
+    pub(super) fn engine(gain: bool, settings: [f32; 4]) -> Self {
+        let settings = if gain { settings } else { [0.0; 4] };
+        Self::Engine { gain, settings }
+    }
 }
 
 impl Post {
@@ -345,6 +369,7 @@ impl Post {
             antialias: false,
             taa: false,
             upscale: 1.0,
+            upscale_held: false,
             taa_on: false,
             target: None,
             taa_resources,
@@ -356,24 +381,28 @@ impl Post {
     }
 
     // History stores baked light, so a change must reject it before jitter records the next frame.
-    pub(super) fn baked_light(
-        &mut self,
-        gain: bool,
-        settings: [f32; 4],
-        gains: [f32; 4],
-        windows: [[f32; 4]; 2],
-    ) {
-        // These uniforms do not change baked colour without gain. Keep compatibility
-        // history stable when only its final display settings change.
-        let key = Some(if gain {
-            (true, settings, gains, windows)
-        } else {
-            (false, [0.0; 4], [0.0; 4], [[0.0; 4]; 2])
-        });
-        if self.light_key != key {
+    pub(super) fn baked_light(&mut self, key: LightKey) {
+        if self.light_key != Some(key) {
             self.taa_previous = None;
-            self.light_key = key;
+            self.light_key = Some(key);
         }
+    }
+
+    /// TAA's next frame starts without history: what it kept was drawn by another pipeline.
+    pub(super) fn forget_history(&mut self) {
+        self.taa_previous = None;
+    }
+
+    /// Holds TAA's upscaling at 1 (`held`) or lets the Upscaling setting apply again. Set
+    /// before a native pack's first frame, so that its world's size, TAA's history and the
+    /// culling agree from it on.
+    pub(super) fn hold_upscale(&mut self, held: bool) {
+        self.upscale_held = held;
+    }
+
+    /// The upscaling TAA applies: `upscale`, or 1 while it is held.
+    fn taa_upscale(&self) -> f32 {
+        if self.upscale_held { 1.0 } else { self.upscale }
     }
 
     /// Whether TAA is supported on this GPU/backend.
@@ -381,23 +410,41 @@ impl Post {
         self.taa_resources.is_some()
     }
 
-    /// The world's rendered size and the size it is shown at (TAA's history).
-    fn sizes(&self, window: [u32; 2]) -> ([u32; 2], [u32; 2]) {
-        let upscale = if self.taa_on { self.upscale } else { 1.0 };
+    /// The world's rendered size and the size it is shown at (TAA's history), smaller by the
+    /// upscaling ratio `pack` renders it for (`prepare`).
+    fn sizes(&self, window: [u32; 2], pack: bool) -> ([u32; 2], [u32; 2]) {
+        let upscale = if pack {
+            self.upscale
+        } else if self.taa_on {
+            self.taa_upscale()
+        } else {
+            1.0
+        };
         self.sizes_with_upscale(window, upscale)
     }
 
     fn sizes_with_upscale(&self, window: [u32; 2], upscale: f32) -> ([u32; 2], [u32; 2]) {
-        let output = window.map(|v| ((v as f32 * self.scale).round() as u32).clamp(1, 8192));
-        (
-            output.map(|v| ((v as f32 / upscale).round() as u32).max(1)),
-            output,
-        )
+        sizes(window, self.scale, upscale)
+    }
+
+    /// The size a native (API 0.2) pack's world draws at: it always has a target (`prepare`'s
+    /// `always`), and TAA's upscaling is off under it (`hold_upscale`), so it gets TAA's
+    /// sizes, not a `shaders/` pack's.
+    pub(super) fn pack_render_size(&self, window: [u32; 2]) -> [u32; 2] {
+        sizes(window, self.scale, 1.0).0
+    }
+
+    /// The scaled world's depth where it was drawn at `size`, the window's: what post effects
+    /// read when 4x MSAA drew the world there.
+    pub(super) fn depth_at(&self, size: [u32; 2]) -> Option<&wgpu::TextureView> {
+        (self.target.as_ref())
+            .filter(|t| t.size == size)
+            .map(|t| &t.depth)
     }
 
     /// The next TAA frame's input size, even before its first jitter or resize.
     pub(super) fn taa_render_size(&self, window: [u32; 2]) -> [u32; 2] {
-        self.sizes_with_upscale(window, self.upscale).0
+        self.sizes_with_upscale(window, self.taa_upscale()).0
     }
 
     /// TAA's sub-pixel jitter this frame, as a clip-space matrix to multiply into the
@@ -410,10 +457,11 @@ impl Post {
             return Mat4::IDENTITY;
         }
         self.taa_frame = self.taa_frame.wrapping_add(1);
-        let (size, _) = self.sizes(window);
+        let (size, _) = self.sizes(window, false);
         // Halton (2, 3) over 8 frames per output pixel (FSR's count), in rendered
         // pixels around the centre.
-        let phases = (8.0 * self.upscale * self.upscale).ceil() as u32;
+        let upscale = self.taa_upscale();
+        let phases = (8.0 * upscale * upscale).ceil() as u32;
         let i = self.taa_frame % phases + 1;
         let offset = Vec2::new(halton(i, 2), halton(i, 3)) - 0.5;
         let jitter = offset * 2.0 / Vec2::new(size[0] as f32, size[1] as f32);
@@ -433,6 +481,13 @@ impl Post {
         Mat4::from_translation(jitter.extend(0.0))
     }
 
+    /// This frame's jitter in clip space, the translation `jitter` multiplies into the
+    /// projection (`frame.jitter` of a 0.2 pack); zero without TAA.
+    pub fn jitter_clip(&self) -> [f32; 2] {
+        let j = self.taa_this_frame.jitter;
+        if self.taa_on { [j[0], j[1]] } else { [0.0; 2] }
+    }
+
     /// This frame's jitter in rendered pixels, y down (FSR's `jitterOffset`); zero
     /// without TAA.
     pub fn jitter_pixels(&self) -> [f32; 2] {
@@ -446,11 +501,17 @@ impl Post {
     /// The world's colour and depth targets this frame, or `None` to draw
     /// it straight to the screen.
     /// `always`: a target even at scale 1 without anti-aliasing (a shader pack reads it).
+    /// `pack`: a `shaders/` pack reads the world, so it renders at the Upscaling ratio's share
+    /// of the window — the pack's own copy of it stretches the smaller picture back, and TAA,
+    /// which would divide for the same reason, never runs under it. Frame generation and a
+    /// native (API 0.2) pack also read the world but stretch nothing themselves: `false` keeps
+    /// them, and a frame without a pack, at TAA's sizes.
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         window: [u32; 2],
         always: bool,
+        pack: bool,
     ) -> Option<(wgpu::TextureView, wgpu::TextureView)> {
         if self.scale == 1.0 && !self.antialias && !self.taa_on && !always {
             self.target = None;
@@ -459,7 +520,7 @@ impl Post {
         // The old target goes first: a slider drag would otherwise hold the old and the new
         // targets together, and the sum is what runs a small GPU out of memory.
         loop {
-            let (size, output) = self.sizes(window);
+            let (size, output) = self.sizes(window, pack);
             let history_size = self.taa_on.then_some(output);
             if self
                 .target
@@ -596,6 +657,7 @@ impl Post {
                 depth,
                 group,
                 taa,
+                resolved: None,
             }
         }
     }
@@ -613,6 +675,48 @@ impl Post {
             );
             self.sharpness = sharpness;
         }
+    }
+
+    /// A target of the world's size and format for `finish` to draw onto, where something
+    /// after it reads the world at its own size (a native pack without a post chain, #16126).
+    /// Made on first use, and dropped with the world's target. None where there is no video
+    /// memory for it: the pack then reads the world without FXAA.
+    pub(super) fn resolved(&mut self, device: &wgpu::Device) -> Option<wgpu::TextureView> {
+        let format = self.format;
+        let target = self.target.as_mut()?;
+        let size = target.size;
+        let view = target.resolved.get_or_insert_with(|| {
+            // As the world's own target: an error raised is fatal, so catch running out of
+            // memory, and the failed texture's view failing validation.
+            let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+            let view = device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("Resolved world"),
+                    size: wgpu::Extent3d {
+                        width: size[0],
+                        height: size[1],
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default());
+            let error = pollster::block_on(memory.pop()).or(pollster::block_on(validation.pop()));
+            if let Some(error) = error {
+                log::warn!(
+                    "Horizon renderer: no video memory for the shader pack's FXAA at {size:?}; drawing it without ({error})"
+                );
+                return None;
+            }
+            Some(view)
+        });
+        view.clone()
     }
 
     /// The size of the world's own target, when it has one.
@@ -647,19 +751,45 @@ impl Post {
         mut timing: Option<&mut super::pack_timing::PassTiming>,
     ) {
         let Some(target) = &self.target else { return };
-        let Some(taa) = target.taa.as_ref().filter(|_| self.taa_previous.is_some()) else {
+        let Some((res, frame, taa)) = self.taa_frame() else {
             self.finish_with(encoder, screen, &target.group, timing.as_deref_mut());
             return;
         };
-        let Some(res) = &self.taa_resources else {
-            self.finish_with(encoder, screen, &target.group, timing.as_deref_mut());
-            return;
+        let shown = res.resolve(queue, encoder, &frame, taa, timing.as_deref_mut());
+        let pipeline = if self.taa_upscale() > 1.0 {
+            &self.sharpen
+        } else {
+            &self.copy
         };
-        let size = self.size().unwrap_or([1, 1]);
+        self.draw_onto(encoder, screen, shown, pipeline, timing);
+    }
+
+    /// TAA's resolve of this frame, when `jitter` had it on: the history it writes is the
+    /// world anti-aliased, for a native pack's output to read in the world's place (#16126).
+    /// At the world's size while the upscaling is held (`hold_upscale`).
+    pub(super) fn resolve_taa(
+        &self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        timing: Option<&mut super::pack_timing::PassTiming>,
+    ) -> Option<wgpu::TextureView> {
+        let (res, frame, taa) = self.taa_frame()?;
+        res.resolve(queue, encoder, &frame, taa, timing);
+        Some(taa.history[(frame.index % 2) as usize].clone())
+    }
+
+    /// What TAA resolves this frame, when `jitter` had it on and the target has a history.
+    fn taa_frame(&self) -> Option<(&TaaResources, UpscaleFrame<'_>, &History)> {
+        let target = self.target.as_ref()?;
+        let taa = target
+            .taa
+            .as_ref()
+            .filter(|_| self.taa_previous.is_some())?;
+        let res = self.taa_resources.as_ref()?;
         let frame = UpscaleFrame {
             color: &target.color,
             depth: &target.depth,
-            render_size: size,
+            render_size: target.size,
             output_size: taa.size,
             jitter_clip: [self.taa_this_frame.jitter[0], self.taa_this_frame.jitter[1]],
             jitter_pixels: self.jitter_pixels(),
@@ -667,13 +797,7 @@ impl Post {
             reset: self.taa_this_frame.jitter[2] > 0.5,
             index: self.taa_frame,
         };
-        let shown = res.resolve(queue, encoder, &frame, taa, timing.as_deref_mut());
-        let pipeline = if self.upscale > 1.0 {
-            &self.sharpen
-        } else {
-            &self.copy
-        };
-        self.draw_onto(encoder, screen, shown, pipeline, timing);
+        Some((res, frame, taa))
     }
 
     /// Draw what `group` binds (`bind`) onto `screen`.
@@ -773,6 +897,16 @@ pub(super) fn reprojection(
 }
 
 /// The radical inverse of `i` in `base`: a low-discrepancy sequence in 0..1.
+/// The world's size and the output's for `window` at resolution scale `scale`, the world
+/// drawn smaller by TAA's `upscale` (1 without it).
+fn sizes(window: [u32; 2], scale: f32, upscale: f32) -> ([u32; 2], [u32; 2]) {
+    let output = window.map(|v| ((v as f32 * scale).round() as u32).clamp(1, 8192));
+    (
+        output.map(|v| ((v as f32 / upscale).round() as u32).max(1)),
+        output,
+    )
+}
+
 fn halton(mut i: u32, base: u32) -> f32 {
     let (mut f, mut r) = (1.0, 0.0);
     while i > 0 {
@@ -801,6 +935,40 @@ mod tests {
         assert!((then.truncate() / then.w - expected.truncate() / expected.w).length() < 1e-9);
     }
 
+    /// A native (API 0.2) pack's kept resources are made before its first frame at the size
+    /// it draws at: none of TAA's upscaling, which is held under a pack (`hold_upscale`), and
+    /// the scale applied with or without a target yet.
+    #[test]
+    fn a_pack_draws_at_the_scaled_window_without_taa_s_upscaling() {
+        for (window, scale, upscale, before, pack) in [
+            ([1280, 720], 1.0, 2.0, [640, 360], [1280, 720]),
+            ([1281, 721], 0.5, 2.0, [321, 181], [641, 361]),
+            ([1920, 1080], 0.75, 1.0, [1440, 810], [1440, 810]),
+            ([10000, 10000], 2.0, 4.0, [2048, 2048], [8192, 8192]),
+        ] {
+            assert_eq!(sizes(window, scale, upscale).0, before);
+            assert_eq!(sizes(window, scale, 1.0).0, pack);
+        }
+    }
+
+    /// A `shaders/` pack's own copy of the world stretches the smaller picture back to the
+    /// window, so the world renders at the Upscaling ratio's share of it: 1280×720 at
+    /// Performance's 2 is 640×360 (#16757). Without the pack the sizes stay what they were.
+    #[test]
+    fn a_shaders_pack_s_world_renders_at_the_upscaling_ratio() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some((device, _)) = test_device() else {
+            eprintln!("Upscaling pack GPU skipped: no test device");
+            return;
+        };
+        let mut post = Post::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        post.upscale = 2.0;
+        let _ = post.prepare(&device, [1280, 720], true, true);
+        assert_eq!(post.size(), Some([640, 360]));
+        let _ = post.prepare(&device, [1280, 720], true, false);
+        assert_eq!(post.size(), Some([1280, 720]));
+    }
+
     #[test]
     fn jitter_stays_inside_the_pixel() {
         for i in 1..=128 {
@@ -815,6 +983,7 @@ mod tests {
 
     #[test]
     fn culling_uses_the_next_taa_size_before_the_first_jitter_or_resize() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, _)) = test_device() else {
             return;
         };
@@ -833,12 +1002,46 @@ mod tests {
             post.taa_on = false;
             assert_eq!(post.taa_render_size(window), expected);
             post.taa_on = true;
-            assert_eq!(post.sizes(window).0, expected);
+            assert_eq!(post.sizes(window, false).0, expected);
+            // A native pack's frame without TAA: what its kept resources are made for.
+            post.taa_on = false;
+            assert_eq!(post.pack_render_size(window), post.sizes(window, false).0);
         }
+    }
+
+    /// Under a native pack the renderer resolves, TAA's upscaling is held at 1 from the pack's
+    /// install on (#16126): the world draws, TAA's history keeps and the culling widens for
+    /// the scaled window, the size the pack's kept resources are made for.
+    #[test]
+    fn a_resolved_pack_gets_taa_at_its_world_s_size() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some((device, _)) = test_device() else {
+            eprintln!("TAA upscale hold GPU skipped: no test device");
+            return;
+        };
+        let mut post = Post::new(&device, wgpu::TextureFormat::Rgba16Float);
+        post.taa = post.supports_taa();
+        let (window, scaled) = ([1281, 721], [641, 361]);
+        post.scale = 0.5;
+        post.upscale = 2.0;
+        assert_eq!(post.taa_render_size(window), [321, 181]);
+        post.hold_upscale(true);
+        assert_eq!(post.taa_render_size(window), scaled);
+        assert_eq!(post.pack_render_size(window), scaled);
+        post.jitter(window, true, Mat4::IDENTITY, DVec3::ZERO);
+        let _ = post.prepare(&device, window, true, false);
+        assert_eq!(post.size(), Some(scaled));
+        let history = post.target.as_ref().and_then(|t| t.taa.as_ref());
+        assert_eq!(history.map(|h| h.size), post.taa.then_some(scaled));
+        // A `shaders/` pack's world keeps the Upscaling ratio's share of the window.
+        assert_eq!(post.sizes(window, true).0, [321, 181]);
+        post.hold_upscale(false);
+        assert_eq!(post.taa_render_size(window), [321, 181]);
     }
 
     #[test]
     fn baked_light_changes_and_returning_from_a_pack_reject_taa_history() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, _)) = test_device() else {
             eprintln!("TAA baked-light GPU skipped: no test device");
             return;
@@ -849,34 +1052,26 @@ mod tests {
             eprintln!("TAA baked-light GPU skipped: TAA unsupported");
             return;
         }
-        let key = (
-            [5.0, 4.0, 1.0, 0.0],
-            [0.2, 0.5, 0.6, 1.0],
-            [[0.1; 4], [0.4; 4]],
-        );
+        let key = [5.0, 4.0, 1.0, 0.0];
         for gain in [true, false, true] {
-            post.baked_light(gain, key.0, key.1, key.2);
+            post.baked_light(LightKey::engine(gain, key));
             post.jitter([32, 32], true, Mat4::IDENTITY, DVec3::ZERO);
             assert_eq!(post.taa_this_frame.jitter[2], 1.0);
-            post.baked_light(gain, key.0, key.1, key.2);
+            post.baked_light(LightKey::engine(gain, key));
             post.jitter([32, 32], true, Mat4::IDENTITY, DVec3::ZERO);
             assert_eq!(post.taa_this_frame.jitter[2], 0.0);
         }
-        for field in 0..16 {
+        for field in 0..4 {
             let mut changed = key;
-            match field {
-                0..=3 => changed.0[field] += 0.01,
-                4..=7 => changed.1[field - 4] += 0.01,
-                _ => changed.2[(field - 8) / 4][(field - 8) % 4] += 0.01,
-            }
-            post.baked_light(true, changed.0, changed.1, changed.2);
+            changed[field] += 0.01;
+            post.baked_light(LightKey::engine(true, changed));
             post.jitter([32, 32], true, Mat4::IDENTITY, DVec3::ZERO);
             assert_eq!(post.taa_this_frame.jitter[2], 1.0);
         }
-        post.baked_light(false, key.0, key.1, key.2);
+        post.baked_light(LightKey::engine(false, key));
         post.jitter([32, 32], true, Mat4::IDENTITY, DVec3::ZERO);
         assert_eq!(post.taa_this_frame.jitter[2], 1.0);
-        post.baked_light(false, [0.0; 4], [0.0; 4], [[0.0; 4]; 2]);
+        post.baked_light(LightKey::engine(false, [0.0; 4]));
         post.jitter([32, 32], true, Mat4::IDENTITY, DVec3::ZERO);
         assert_eq!(post.taa_this_frame.jitter[2], 0.0);
         // A pack disables TAA even when the light settings stay the same. Its first
@@ -886,8 +1081,31 @@ mod tests {
         assert_eq!(post.taa_this_frame.jitter[2], 1.0);
         post.jitter([32, 32], true, Mat4::IDENTITY, DVec3::ZERO);
         assert_eq!(post.taa_this_frame.jitter[2], 0.0);
+        // A pack the renderer resolves keeps TAA on: its install, the display's values and
+        // the return to no pack each drop the history, and its frames alone keep it.
+        let display = super::super::output::DisplayValues::SDR;
+        post.forget_history();
+        post.baked_light(LightKey::engine(false, [0.0; 4]));
+        post.jitter([32, 32], true, Mat4::IDENTITY, DVec3::ZERO);
+        assert_eq!(post.taa_this_frame.jitter[2], 1.0);
+        for (key, reset) in [
+            (LightKey::Pack(display), 1.0),
+            (LightKey::Pack(display), 0.0),
+            (
+                LightKey::Pack(super::super::output::DisplayValues {
+                    hdr: true,
+                    ..display
+                }),
+                1.0,
+            ),
+            (LightKey::engine(false, [0.0; 4]), 1.0),
+        ] {
+            post.baked_light(key);
+            post.jitter([32, 32], true, Mat4::IDENTITY, DVec3::ZERO);
+            assert_eq!(post.taa_this_frame.jitter[2], reset, "{key:?}");
+        }
         eprintln!(
-            "TAA baked-light GPU checked gain, all settings/gains/windows and the first frame after a pack"
+            "TAA baked-light GPU checked gain, all settings, a pack's display and the first frame after a pack"
         );
     }
 
@@ -899,6 +1117,7 @@ mod tests {
 
     #[test]
     fn world_post_pipelines_compile_or_fall_back() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, _)) = test_device() else {
             return;
         };
