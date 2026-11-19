@@ -254,12 +254,11 @@ def shulker(rng, seed):
     if rng.random() < 0.3:
         nbt['Peek'] = rng.choice(['30b', '100b'])
     dx, dz = rng.choice([(4, 0), (-4, 0), (0, 4), (0, -4), (3, 3), (6, 0), (0, 8)])
-    steps = [{'k': 'summon', 'type': 'shulker', 'at': [7.5, 0, 7.5], 'n': 0, 'nbt': nbt},
-             {'k': 'cmd', 'at': [[7 + dx, 0, 7 + dz]], 'cmd': '/tp @a {0}'}]
+    steps = [{'k': 'summon', 'type': 'shulker', 'at': [7.5, 0, 7.5], 'n': 0, 'nbt': nbt}]
     for _ in range(rng.choice([4, 5, 6])):
         steps += [{'k': 'tick', 'n': rng.choice([5, 10, 12])}, {'k': 'read_near', 'type': 'shulker_bullet', 'at': [7, 0, 7]},
                   {'k': 'read_entity', 'n': 0}]
-    return {'family': 'shulker', 'seed': seed, 'steps': steps}
+    return {'family': 'shulker', 'seed': seed, 'player_at': [7 + dx, 0, 7 + dz], 'steps': steps}
 
 
 def uuid_arg(n):

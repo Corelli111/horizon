@@ -150,6 +150,19 @@ class ShulkerHitTests(unittest.TestCase):
         self.assertIsNone(invalid)
         self.assertEqual(failure[2], [('<hit>', [[True, 26]], [[True, 30]])])
 
+        reduced = fuzz.reduce(scenario, set(fuzz.edits(scenario)))
+        retained, = (op for op in fuzz.render(reduced, 0) if op.get('guard'))
+        self.assertEqual(retained['cmd'], guard['cmd'])
+
+    def test_shulker_shooting_observes_a_survival_player_then_restores_creative(self):
+        scenario = families.shulker(random.Random(0), 0)
+        ops = fuzz.render(scenario, 0)
+        player_modes = [op for op in ops if op.get('cmd', '').startswith('/gamemode')]
+        self.assertEqual([op['cmd'] for op in player_modes], ['/gamemode survival @a', '/gamemode creative @a'])
+        ticks = [i for i, op in enumerate(ops) if op['op'] == 'tick']
+        self.assertLess(ops.index(player_modes[0]), min(ticks))
+        self.assertGreater(ops.index(player_modes[1]), max(ticks))
+
 
 class ReloadWitnessTests(unittest.TestCase):
     def test_a_reload_gives_the_oracle_time_to_unload_the_chunk(self):

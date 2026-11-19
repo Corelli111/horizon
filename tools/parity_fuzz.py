@@ -211,6 +211,12 @@ def render(scenario, slot):
     ops = [cmd(f'/forceload add {x0} {z0}', -1, False), {'op': 'wait_chunks', 'chunks': chunk},
            cmd(f'/fill {x0} {y0 - 1} {z0} {x0 + 15} {y0 - 1} {z0 + 15} minecraft:stone', -1, False),
            sync_op(seed, slot)]
+    player_at = scenario.get('player_at')
+    if player_at is not None:
+        # A survival player can be targeted. Resistance keeps repeated scenarios from depleting their health.
+        ops += [cmd('/gamemode survival @a', -1, False),
+                cmd('/effect give @a minecraft:resistance 10 4 true', -1, False),
+                cmd(f'/tp @a {at(player_at)}', -1, False)]
     for i, step in enumerate(scenario['steps']):
         kind = step['k']
         if kind == 'summon':
@@ -257,7 +263,11 @@ def render(scenario, slot):
             ops.append({**cmd(f'/data get block {at(step["at"])}', i), 'read': True})
         else:
             raise ValueError(kind)
-    if any('/tp @a' in s.get('cmd', '') for s in scenario['steps']):  # the player goes home
+    if player_at is not None:
+        ops += [cmd('/gamemode creative @a', -1, False),
+                cmd('/effect clear @a minecraft:resistance', -1, False),
+                cmd('/effect clear @a minecraft:levitation', -1, False)]
+    if player_at is not None or any('/tp @a' in s.get('cmd', '') for s in scenario['steps']):
         ops.append(cmd('/tp @a 8.5 230 8.5', -1, False))
     ops += [cmd(f'/kill @e[type=!player,x={x0},y={y0 - 8},z={z0},dx=16,dy=48,dz=16]', -1, False),
             cmd(f'/fill {x0} {y0 - 1} {z0} {x0 + 15} {y0 + 12} {z0 + 15} minecraft:air', -1, False),
@@ -408,7 +418,8 @@ def reduce(scenario, edits):
 
 def edits(scenario):
     for i, step in enumerate(scenario['steps']):
-        if step['k'] == 'sync':  # a control for the comparison, not part of the scenario: shrinking keeps it
+        if step['k'] == 'sync' or step.get('guard'):
+            # Each reduced scenario must still check the same preconditions.
             continue
         if step['k'] == 'tick' and step['n'] > 1:
             yield ('half', i)
