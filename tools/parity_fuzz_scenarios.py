@@ -225,18 +225,29 @@ def shulker(rng, seed):
             at = [6.5 + rng.randint(0, 3), 0, 6.5 + rng.randint(0, 3)] if i else [7.5, 0, 7.5]
             steps.append({'k': 'summon', 'type': 'shulker', 'at': at, 'n': i, 'nbt': nbt})
         owner = rng.randint(1, count - 1)
-        if rng.random() < 0.7:  # the damage of a bullet that never flew, from another shulker
+        live_bullet = rng.random() >= 0.7
+        if not live_bullet:  # the damage of a bullet that never flew, from another shulker
             steps.append({'k': 'summon', 'type': 'shulker_bullet', 'at': [9.5, 2, 9.5], 'n': 20,
                           'nbt': {'NoGravity': '1b'}})
             steps.append({'k': 'cmd', 'at': [], 'uuids': True,
                           'cmd': f'/damage {uuid_arg(0)} 1 minecraft:mob_projectile by {uuid_arg(20)} from {uuid_arg(owner)}'})
-        else:  # a bullet above the shulker, homing on it, its owner another shulker
-            steps.append({'k': 'summon', 'type': 'shulker_bullet', 'at': [7.5, 3.5, 7.5], 'n': 20,
-                          'nbt': {'Owner': '{iu%d}' % owner, 'Steps': '10', 'Dir': '"down"', 'Target': '{iu0}'}})
+        else:
+            # Keep the victim attached to the floor and its starting health known. Give the bullet a
+            # downward flight close enough to reach the victim during the observation.
+            steps[0]['nbt'].update(AttachFace='0b', Health='30.0f')
+            for step in steps[1:]:
+                if step['at'] == steps[0]['at']:
+                    step['at'] = [6.5, 0, 6.5]
+            steps.append({'k': 'summon', 'type': 'shulker_bullet', 'at': [7.5, 1.6, 7.5], 'n': 20,
+                          'nbt': {'Owner': '{iu%d}' % owner, 'Target': '{iu0}', 'Steps': '10', 'Dir': '0',
+                                  'Motion': '[0.0d,-0.8d,0.0d]', 'TYD': '-1.0d'}})
         for _ in range(rng.choice([2, 3, 4])):
             steps += [{'k': 'tick', 'n': 1},
                       {'k': 'cmd', 'at': [[7, 0, 7]], 'cmd': '/execute positioned {0} if entity @e[type=shulker,distance=..40]'},
                       {'k': 'read_near', 'type': 'shulker', 'at': [7, 0, 7]}]
+        if live_bullet:
+            steps.append({'k': 'cmd', 'at': [], 'uuids': True, 'cmd': '/data get entity {u0} Health',
+                          'guard': 'shulker_hit'})
         steps += [{'k': 'read_entity', 'n': i} for i in range(count)]
         return {'family': 'shulker', 'seed': seed, 'steps': steps}
     nbt = {'PersistenceRequired': '1b', 'AttachFace': rng.choice(['0b', '0b', '1b', '2b', '3b', '4b', '5b'])}

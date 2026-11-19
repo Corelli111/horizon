@@ -224,7 +224,10 @@ def render(scenario, slot):
             text = step['cmd']
             if step.get('uuids'):  # `{uN}`: the UUID of the entity summoned as n=N
                 text = re.sub(r'\{u(\d+)\}', lambda m: uuid_text(uuid_words(slot, int(m.group(1)))), text)
-            ops.append(cmd(text.format(*[at(o) for o in step.get('at', [])]), i))
+            op = cmd(text.format(*[at(o) for o in step.get('at', [])]), i)
+            if 'guard' in step:
+                op['guard'] = step['guard']
+            ops.append(op)
         elif kind == 'tick':
             ops.append({'op': 'tick', 'n': step['n']})
         elif kind == 'dispense':
@@ -278,14 +281,14 @@ def subject(scenario, step):
 # Running batches through the command-exec harness.
 
 def witness(family, op, vanilla, rust):
-    """A reload witness's outcome: (why the scenario is invalid, the divergence), either or both None.
-
-    Vanilla keeping what a reload should have unloaded means the scenario saved nothing and loaded it back, so
-    it is invalid rather than a divergence; a Horizon result that differs from vanilla's is a divergence (#16772).
-    """
-    invalid = (f'vanilla kept the {op["guard"]} loaded: {vanilla["results"]}'
-               if vanilla['results'] != GUARDS[op['guard']] else None)
-    failure = ((f'{family}|{op["guard"]}|<unload>', op['cmd'], [('<unload>', vanilla['results'], rust['results'])])
+    """Require the scenario's precondition in vanilla and compare the corresponding Horizon result."""
+    guard = op['guard']
+    if guard == 'shulker_hit':
+        field, expected, reason = '<hit>', [[True, 26]], 'vanilla bullet did not deal four damage'
+    else:
+        field, expected, reason = '<unload>', GUARDS[guard], f'vanilla kept the {guard} loaded'
+    invalid = f'{reason}: {vanilla["results"]}' if vanilla['results'] != expected else None
+    failure = ((f'{family}|{guard}|{field}', op['cmd'], [(field, vanilla['results'], rust['results'])])
                if rust['results'] != vanilla['results'] else None)
     return invalid, failure
 
