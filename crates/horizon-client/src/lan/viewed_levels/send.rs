@@ -326,7 +326,7 @@ impl Hub {
             let (taken, bodies): (Vec<_>, Vec<_>) = taken
                 .into_iter()
                 .filter_map(|(idx, chunk)| {
-                    self.protected_body(protected, rules.clone(), chunk, world, &protos, false)
+                    self.protected_body(protected, &rules, chunk, world, &protos, false)
                         .map(|body| ((idx, chunk), body))
                 })
                 .take(budget)

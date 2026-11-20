@@ -3,7 +3,7 @@ use crate::{
     fast_hash::{FxHashMap, FxHashSet},
     lan::{
         chunk_watch,
-        terrain_view::{self, Column, Pos, Rules},
+        terrain_view::{self, Column, EncodeContext, Pos, Ready, Rules},
         viewed_levels::send::Runs,
     },
     world::World,
@@ -87,10 +87,127 @@ impl Hub {
         }
     }
 
+    /// Start the protected packets for newly ready columns while the level is still ticking.
+    /// At most half the resident queue is reserved by this look-ahead.
+    pub fn warm_admitted_terrain(
+        &mut self,
+        world: &World,
+        streaming: &crate::streaming::Streaming,
+        columns: impl IntoIterator<Item = (i32, i32)>,
+    ) {
+        let Some(terrain) = self.terrain.as_mut() else {
+            return;
+        };
+        if !terrain.resident.can_warm() {
+            return;
+        }
+        let dimension = &self.config.dimension;
+        let has_view = self
+            .guests
+            .iter()
+            .any(|g| g.watches_level(dimension) && terrain.view(g.conn, dimension).is_some());
+        if !has_view {
+            return;
+        }
+        let protos = |x, z| streaming.proto_sections(x, z);
+        let ctx = EncodeContext {
+            dimension,
+            encoder: &self.encoder,
+            world,
+            protos: &protos,
+            include_far: self.far.is_some(),
+        };
+        terrain.resident.poll();
+        for at @ (x, z) in columns.into_iter().take(64) {
+            let Some(chunk) = world
+                .chunks
+                .get(&at)
+                .filter(|c| c.lit && c.postprocess.is_empty())
+            else {
+                continue;
+            };
+            if !super::neighbours_ready(&world.chunks, |x, z| protos(x, z).is_some(), chunk) {
+                continue;
+            }
+            for guest in self.guests.iter().filter(|g| g.watches_level(dimension)) {
+                let (cx, cz) = guest.chunk();
+                if !super::tracked(cx, cz, guest.view_distance, x, z)
+                    || guest.sent_chunks.contains(&at)
+                {
+                    continue;
+                }
+                if let Some(rules) = terrain
+                    .view(guest.conn, dimension)
+                    .map(|(_, rules)| rules.clone())
+                {
+                    terrain.resident.get(&ctx, &rules, at);
+                    if !terrain.resident.can_warm() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) fn warm_first_terrain(
+        &mut self,
+        i: usize,
+        world: &World,
+        streaming: Option<&crate::streaming::Streaming>,
+    ) {
+        let guest = &self.guests[i];
+        let Some(rules) = self.terrain_rules(guest.conn) else {
+            return;
+        };
+        let protos = |x, z| streaming.and_then(|s| s.proto_sections(x, z));
+        let ctx = EncodeContext {
+            dimension: &self.config.dimension,
+            encoder: &self.encoder,
+            world,
+            protos: &protos,
+            include_far: self.far.is_some(),
+        };
+        let resident = &mut self.terrain.as_mut().unwrap().resident;
+        for &at in guest.chunk_queue.iter().take(32) {
+            if !resident.can_warm() {
+                break;
+            }
+            if let Some(chunk) = world
+                .chunks
+                .get(&at)
+                .filter(|c| c.lit && c.postprocess.is_empty())
+                && (streaming.is_none()
+                    || super::neighbours_ready(&world.chunks, |x, z| protos(x, z).is_some(), chunk))
+            {
+                resident.get(&ctx, &rules, at);
+            }
+        }
+    }
+
+    pub(in crate::lan) fn protected_ready(
+        &mut self,
+        rules: &Arc<Rules>,
+        world: &World,
+        protos: &dyn Fn(i32, i32) -> Option<crate::section_mask::SectionMask>,
+        at: Column,
+    ) -> Option<Ready> {
+        self.terrain.as_mut()?.resident.get(
+            &EncodeContext {
+                dimension: &self.config.dimension,
+                encoder: &self.encoder,
+                world,
+                protos,
+                include_far: self.far.is_some(),
+            },
+            rules,
+            at,
+        )
+    }
+
     pub(in crate::lan) fn protected_body(
         &mut self,
         bodies: &mut Bodies,
-        rules: Arc<Rules>,
+        rules: &Arc<Rules>,
         chunk: &Chunk,
         world: &World,
         protos: &dyn Fn(i32, i32) -> Option<crate::section_mask::SectionMask>,
@@ -101,22 +218,37 @@ impl Hub {
         if let Some(body) = bodies.entries.get(&key) {
             return Some(body.clone());
         }
+        let ready = self.protected_ready(rules, world, protos, at)?;
+        self.finish_protected_body(bodies, key, chunk, world, protos, ready)
+    }
+
+    pub(super) fn finish_protected_body(
+        &self,
+        bodies: &mut Bodies,
+        key: (u64, Column, bool),
+        chunk: &Chunk,
+        world: &World,
+        protos: &dyn Fn(i32, i32) -> Option<crate::section_mask::SectionMask>,
+        ready: Ready,
+    ) -> Option<Arc<[u8]>> {
+        let far = key.2;
+        if let Ready::Shared(body) = &ready
+            && !body.has_entities()
+        {
+            return Some(body.static_body(far).clone());
+        }
+        if let Some(body) = bodies.entries.get(&key) {
+            return Some(body.clone());
+        }
         if bodies.entries.len() == 32 || bodies.bytes >= BODY_CACHE_BYTES {
             return None;
         }
-        let wires = self.terrain.as_mut()?.resident.get(
-            &self.config.dimension,
-            &self.encoder,
-            rules,
-            world,
-            at,
-        )?;
-        let body: Arc<[u8]> = self
-            .encoder
-            .terrain_body(chunk, world, protos, far, &wires)
-            .into();
-        // At most the resident queue's worth of bodies are kept by this pass. In particular,
-        // memory connections cannot build a second unbounded burst cache.
+        let body = match ready {
+            Ready::Shared(body) => self.encoder.terrain_body(chunk, world, &body, far),
+            Ready::Ordinary if far => self.encoder.body_far(chunk, world).into(),
+            Ready::Ordinary => self.encoder.body_with(chunk, world, protos).into(),
+        };
+        // Bodies with live tags are only shared within this pass.
         if bodies.bytes + body.len() > BODY_CACHE_BYTES {
             return None;
         }

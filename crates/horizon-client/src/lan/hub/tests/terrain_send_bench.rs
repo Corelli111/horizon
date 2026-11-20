@@ -55,8 +55,12 @@ pub(super) fn burst(hub: &mut Hub) -> (f64, f64) {
         hub.guests.push(guest);
         receivers.push(rx);
     }
+    let paced = std::env::var_os("HORIZON_TERRAIN_BENCH_PACED").is_some();
+    let warm = std::env::var_os("HORIZON_TERRAIN_BENCH_WARM").is_some();
+    let cadence = Duration::from_millis(if paced { 50 } else { 1 });
     for i in 0..PLAYERS as usize {
-        hub.guests.update(i, |g| g.chunks_per_tick = 128.0);
+        hub.guests
+            .update(i, |g| g.chunks_per_tick = if paced { 9.0 } else { 128.0 });
     }
     let columns = world.chunks.len();
     let mut next_entity = 100;
@@ -79,39 +83,64 @@ pub(super) fn burst(hub: &mut Hub) -> (f64, f64) {
         border: &border,
         streaming: None,
     };
-    let start = Instant::now();
-    let mut on_tick = Duration::ZERO;
-    let mut passes = 0;
-    while hub.guests.iter().any(|g| g.sent_chunks.len() < columns) {
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "spawn send stalled"
+    let wave = |hub: &mut Hub| {
+        let start = Instant::now();
+        let mut on_tick = Duration::ZERO;
+        let mut longest = Duration::ZERO;
+        let mut passes = 0;
+        while hub.guests.iter().any(|g| g.sent_chunks.len() < columns) {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "spawn send stalled"
+            );
+            hub.ticks += 2;
+            for i in 0..PLAYERS as usize {
+                hub.guests.update(i, |g| g.unacknowledged = 0);
+            }
+            let tick = Instant::now();
+            hub.update_chunks(&ctx);
+            let spent = tick.elapsed();
+            on_tick += spent;
+            longest = longest.max(spent);
+            passes += 1;
+            for rx in &receivers {
+                rx.try_iter().for_each(drop);
+            }
+            if hub.guests.iter().any(|g| g.sent_chunks.len() < columns) {
+                std::thread::sleep(cadence.saturating_sub(tick.elapsed()));
+            }
+        }
+        let elapsed = start.elapsed();
+        let sent = f64::from(PLAYERS) * columns as f64;
+        println!(
+            "sent {sent:.0} columns in {passes} passes; longest {:.3} ms",
+            longest.as_secs_f64() * 1e3
         );
-        hub.ticks += 2;
+        (sent / elapsed.as_secs_f64(), on_tick.as_secs_f64() * 1e3)
+    };
+    if warm {
+        wave(hub);
+        // New deliveries to the same recipients, under the same rules and resident sections.
         for i in 0..PLAYERS as usize {
-            hub.guests.update(i, |g| g.unacknowledged = 0);
-        }
-        let tick = Instant::now();
-        hub.update_chunks(&ctx);
-        on_tick += tick.elapsed();
-        passes += 1;
-        for rx in &receivers {
-            rx.try_iter().for_each(drop);
-        }
-        // Give the encoder its budget between simulated ticks, as a real tick loop does.
-        if hub.guests.iter().any(|g| g.sent_chunks.len() < columns) {
-            std::thread::sleep(Duration::from_millis(1));
+            hub.guests.update(i, |g| {
+                g.center = None;
+                g.sent_chunks.clear();
+            });
         }
     }
-    let elapsed = start.elapsed();
-    let sent = f64::from(PLAYERS) * columns as f64;
-    println!("sent {sent:.0} columns in {passes} passes");
-    (sent / elapsed.as_secs_f64(), on_tick.as_secs_f64() * 1e3)
+    wave(hub)
 }
 
 pub(super) fn median(mut measure: impl FnMut() -> (f64, f64)) -> (f64, f64) {
     let _ = measure();
-    let (mut rate, mut tick): (Vec<_>, Vec<_>) = (0..9).map(|_| measure()).unzip();
+    let (mut rate, mut tick): (Vec<_>, Vec<_>) =
+        (0..if std::env::var_os("HORIZON_TERRAIN_BENCH_PACED").is_some() {
+            3
+        } else {
+            9
+        })
+            .map(|_| measure())
+            .unzip();
     rate.sort_by(f64::total_cmp);
     tick.sort_by(f64::total_cmp);
     (rate[rate.len() / 2], tick[tick.len() / 2])

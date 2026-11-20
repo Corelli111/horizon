@@ -2664,6 +2664,16 @@ impl Game<'_> {
         if let Some(host) = self.lan.as_mut() {
             host.hub
                 .terrain_residency_changed(loaded.iter().map(|&(x, z, _)| (x, z)));
+            let lit = self
+                .world
+                .light_log
+                .iter()
+                .flat_map(|log| log.keys().copied());
+            host.hub.warm_admitted_terrain(
+                &self.world,
+                &self.streaming,
+                loaded.iter().map(|&(x, z, _)| (x, z)).chain(lit),
+            );
         }
         for (x, z, new) in loaded {
             self.native_chunk_load(dimension, [x, z], new);

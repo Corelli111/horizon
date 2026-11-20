@@ -6,14 +6,14 @@
 
 use super::{
     chunks::ChunkEncoder,
-    terrain_view::{self, Neighbours, Rules},
+    terrain_view::{self, Faces, Neighbours, Rules},
 };
+use crate::world::World;
 use crate::{biome::Biomes, fast_hash::FxHashMap, save::SaveDir};
-use crate::{chunk::Chunk, world::World};
 use horizon_world::registry::BlockRegistry;
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex, Weak, mpsc},
+    sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
 
@@ -40,10 +40,14 @@ const READERS: usize = 2;
 /// A level's place in `Far::levels`, and a chunk of it.
 type Key = (usize, i32, i32, u64);
 type ColumnKey = (usize, i32, i32);
-type Faces = [Option<Weak<Chunk>>; 4];
 type SavedBody = (Instant, Arc<[u8]>, Option<Faces>);
 type Variants = FxHashMap<u64, SavedBody>;
-type Done = (Key, Option<Vec<u8>>, Option<Faces>);
+fn protected_bytes((_, body, faces): &SavedBody) -> usize {
+    body.len() + faces.as_ref().map_or(0, Faces::bytes)
+}
+
+type ReadBody = (Vec<u8>, Option<Faces>);
+type Done = (Key, Option<ReadBody>);
 
 /// What the readers read a level from.
 pub struct Source {
@@ -54,7 +58,7 @@ pub struct Source {
 
 /// Reads a saved chunk's body: the game's reads it with `SaveDir::load_far`, encoded by
 /// `ChunkEncoder::body_alone`.
-type Reader = Arc<dyn Fn(&Source, i32, i32, Option<&View>) -> Option<Vec<u8>> + Send + Sync>;
+type Reader = Arc<dyn Fn(&Source, i32, i32, Option<&View>) -> Option<ReadBody> + Send + Sync>;
 
 struct View {
     rules: Arc<Rules>,
@@ -119,11 +123,14 @@ impl Far {
                 let chunk = source.save.load_far(x, z, registry, &biomes)?;
                 Some(match view {
                     Some(view) => {
-                        source
-                            .encoder
-                            .terrain_body_alone(&chunk, &view.neighbours, &view.rules)
+                        let (body, faces) = source.encoder.terrain_body_alone(
+                            &chunk,
+                            &view.neighbours,
+                            &view.rules,
+                        );
+                        (body, Some(faces))
                     }
-                    None => source.encoder.body_alone(&chunk),
+                    None => (source.encoder.body_alone(&chunk), None),
                 })
             }),
         )
@@ -134,7 +141,10 @@ impl Far {
         max: i32,
         read_one: Arc<dyn Fn(&Source, i32, i32) -> Option<Vec<u8>> + Send + Sync>,
     ) -> Self {
-        Self::start(max, Arc::new(move |source, x, z, _| read_one(source, x, z)))
+        Self::start(
+            max,
+            Arc::new(move |source, x, z, _| read_one(source, x, z).map(|bytes| (bytes, None))),
+        )
     }
 
     fn start(max: i32, read_one: Reader) -> Self {
@@ -153,12 +163,7 @@ impl Far {
                             return;
                         };
                         let body = read_one(&source, x, z, view.as_ref());
-                        let faces = view.as_ref().map(|v| {
-                            v.neighbours
-                                .each_ref()
-                                .map(|c| c.as_ref().map(Arc::downgrade))
-                        });
-                        if read.send((key, body, faces)).is_err() {
+                        if read.send((key, body)).is_err() {
                             return;
                         }
                     }
@@ -229,7 +234,7 @@ impl Far {
         rules: &Arc<Rules>,
         world: &World,
     ) -> Saved {
-        self.find_saved(x, z, rules.generation, Some(world), || {
+        self.find_saved(x, z, rules.generation, Some((world, rules)), || {
             Some(View {
                 rules: rules.clone(),
                 neighbours: terrain_view::neighbours(world, (x, z)),
@@ -242,7 +247,7 @@ impl Far {
         x: i32,
         z: i32,
         generation: u64,
-        world: Option<&World>,
+        world: Option<(&World, &Rules)>,
         view: impl FnOnce() -> Option<View>,
     ) -> Saved {
         let Some(level) = self.here else {
@@ -250,7 +255,7 @@ impl Far {
         };
         let column = (level, x, z);
         let key = (level, x, z, generation);
-        let source = &self.levels[level];
+        let source = &mut self.levels[level];
         if generation == 0 {
             if let Some((at, body)) = source.bodies.get(&(x, z)) {
                 if at.elapsed() < KEPT_FOR {
@@ -260,19 +265,13 @@ impl Far {
             }
         } else if let Some((at, body, faces)) = source
             .protected
-            .get(&(x, z))
-            .and_then(|v| v.get(&generation))
+            .get_mut(&(x, z))
+            .and_then(|v| v.get_mut(&generation))
         {
             if at.elapsed() < KEPT_FOR
-                && world.zip(faces.as_ref()).is_some_and(|(world, faces)| {
-                    terrain_view::adjacent((x, z))
-                        .zip(faces)
-                        .all(|(key, face)| match (world.chunks.get(&key), face) {
-                            (None, None) => true,
-                            (Some(chunk), Some(face)) => Arc::as_ptr(chunk) == Weak::as_ptr(face),
-                            _ => false,
-                        })
-                })
+                && world
+                    .zip(faces.as_mut())
+                    .is_some_and(|((world, rules), faces)| faces.current(world, rules, (x, z)))
             {
                 return Saved::Body(body.clone());
             }
@@ -300,14 +299,14 @@ impl Far {
 
     /// Takes in what the readers have read.
     pub fn poll(&mut self) {
-        while let Ok((key, body, faces)) = self.done.try_recv() {
+        while let Ok((key, body)) = self.done.try_recv() {
             let Some(stale) = self.asked.remove(&key) else {
                 continue;
             };
             self.protected_asked -= usize::from(key.3 != 0);
             match body {
                 _ if stale => {}
-                Some(body) => self.keep(key, body.into(), faces),
+                Some((body, faces)) => self.keep(key, body.into(), faces),
                 None => {
                     if self.missing.len() >= 16_384 {
                         self.missing.retain(|_, at| at.elapsed() < MISSING_FOR);
@@ -324,19 +323,23 @@ impl Far {
     fn keep(&mut self, key: Key, body: Arc<[u8]>, faces: Option<Faces>) {
         let (level, x, z, generation) = key;
         let now = Instant::now();
-        self.bytes += body.len();
+        self.bytes += body.len() + faces.as_ref().map_or(0, Faces::bytes);
         let source = &mut self.levels[level];
         let old = if generation == 0 {
-            source.bodies.insert((x, z), (now, body)).map(|(_, b)| b)
+            source
+                .bodies
+                .insert((x, z), (now, body))
+                .map_or(0, |(_, b)| b.len())
         } else {
             source
                 .protected
                 .entry((x, z))
                 .or_default()
                 .insert(generation, (now, body, faces))
-                .map(|(_, b, _)| b)
+                .as_ref()
+                .map_or(0, protected_bytes)
         };
-        self.bytes -= old.map_or(0, |b| b.len());
+        self.bytes -= old;
         self.order.push_back((key, now));
         while self.bytes > KEPT_BYTES {
             self.drop_oldest();
@@ -372,7 +375,8 @@ impl Far {
         } else if let Some(variants) = source.protected.get_mut(&(x, z)) {
             self.bytes -= variants
                 .remove(&generation)
-                .map_or(0, |(_, body, _)| body.len());
+                .as_ref()
+                .map_or(0, protected_bytes);
             if variants.is_empty() {
                 source.protected.remove(&(x, z));
             }
@@ -387,10 +391,7 @@ impl Far {
         self.missing.remove(&(level, x, z));
         self.remove_body((level, x, z, 0));
         if let Some(variants) = self.levels[level].protected.remove(&(x, z)) {
-            self.bytes -= variants
-                .into_values()
-                .map(|(_, b, _)| b.len())
-                .sum::<usize>();
+            self.bytes -= variants.values().map(protected_bytes).sum::<usize>();
         }
         if self.protected_asked == 0 {
             if let Some(stale) = self.asked.get_mut(&(level, x, z, 0)) {
@@ -421,7 +422,7 @@ impl Far {
             .protected
             .drain()
             .flat_map(|(_, v)| v.into_values())
-            .map(|(_, b, _)| b.len())
+            .map(|body| protected_bytes(&body))
             .sum::<usize>();
         self.missing.retain(|&(l, _, _), _| l != level);
         for (_, stale) in self.asked.iter_mut().filter(|((l, ..), _)| *l == level) {

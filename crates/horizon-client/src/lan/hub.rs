@@ -2812,7 +2812,12 @@ impl Hub {
         let mut batches = Vec::new();
         for i in 0..self.guests.len() {
             if self.watches(&self.guests[i]) {
+                let moved =
+                    self.terrain.is_some() && self.guests[i].center != Some(self.guests[i].chunk());
                 self.update_view(i, watching);
+                if moved || self.terrain.is_some() && self.ticks <= self.guests[i].placed_at + 1 {
+                    self.warm_first_terrain(i, world, ctx.streaming);
+                }
                 if let Some(batch) = self.next_batch(i, world, ctx.streaming) {
                     batches.push((i, batch));
                 }
@@ -2835,18 +2840,24 @@ impl Hub {
                     .near
                     .into_iter()
                     .filter_map(|(idx, chunk)| {
-                        if let Some(rules) = &rules {
-                            self.protected_body(
-                                &mut protected,
-                                rules.clone(),
-                                chunk,
-                                world,
-                                &protos,
-                                false,
-                            )
-                            .map(|body| (idx, Body::Saved(body)))
-                        } else {
-                            Some((idx, Body::Level(columns.add(chunk))))
+                        let at = (chunk.x, chunk.z);
+                        match rules.as_ref() {
+                            None => Some((idx, Body::Level(columns.add(chunk)))),
+                            Some(rules) => match self.protected_ready(rules, world, &protos, at)? {
+                                super::terrain_view::Ready::Ordinary => {
+                                    Some((idx, Body::Level(columns.add(chunk))))
+                                }
+                                ready => self
+                                    .finish_protected_body(
+                                        &mut protected,
+                                        (rules.generation, at, false),
+                                        chunk,
+                                        world,
+                                        &protos,
+                                        ready,
+                                    )
+                                    .map(|body| (idx, Body::Saved(body))),
+                            },
                         }
                     })
                     .unzip();
@@ -2856,7 +2867,7 @@ impl Hub {
                         Column::Level(chunk) if rules.is_some() => {
                             let Some(body) = self.protected_body(
                                 &mut protected,
-                                rules.as_ref().unwrap().clone(),
+                                rules.as_ref().unwrap(),
                                 chunk,
                                 world,
                                 &protos,
@@ -2893,6 +2904,7 @@ impl Hub {
                 .map(|&i| g.chunk_queue[i])
                 .chain(far.iter().map(|&i| g.far_queue[i]));
             let overlays = self.terrain_overlays(g.conn, world, keys);
+            let protected = self.terrain_protected(g.conn, &g.dimension);
             self.guests.update(i, |g| {
                 let size = batch.len();
                 // The single-player window shares the sections it is sent (handoff.rs).
@@ -2902,7 +2914,7 @@ impl Hub {
                     g.send(&C::ChunkBatchStart(horizon_protocol::packets::Empty));
                     g.sender.send_many(batch.into_iter().map(|body| match body {
                         Body::Level(j) => {
-                            if memory {
+                            if memory && !protected {
                                 super::handoff::offer(chunks[j]);
                             }
                             uses[j] -= 1;
@@ -3077,6 +3089,14 @@ impl Hub {
                 })
         };
         let rules = self.terrain_rules(g.conn);
+        let protos = |x, z| streaming.and_then(|s| s.proto_sections(x, z));
+        let encode = super::terrain_view::EncodeContext {
+            dimension: &self.config.dimension,
+            encoder: &self.encoder,
+            world,
+            protos: &protos,
+            include_far: self.far.is_some(),
+        };
         let mut terrain = self.terrain.as_mut();
         let near: Vec<_> = g
             .chunk_queue
@@ -3095,13 +3115,7 @@ impl Hub {
                         .as_deref_mut()
                         .unwrap()
                         .resident
-                        .get(
-                            &self.config.dimension,
-                            &self.encoder,
-                            rules.clone(),
-                            world,
-                            (c.x, c.z),
-                        )
+                        .get(&encode, rules, (c.x, c.z))
                         .is_some()
                 })
             })

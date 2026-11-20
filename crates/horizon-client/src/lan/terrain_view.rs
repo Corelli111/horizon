@@ -1,8 +1,9 @@
 //! Prepared terrain rules and bounded resident-column work for outbound terrain.
-use super::chunks::{ChunkEncoder, TerrainEncoder, TerrainWires};
+use super::chunks::{ChunkEncoder, TerrainBody, TerrainEncoder, TerrainSections};
 use crate::{
     chunk::Chunk,
     fast_hash::{FxHashMap, FxHashSet},
+    section_mask::SectionMask,
     world::World,
 };
 use mod_api::{BlockState, TerrainPattern, TerrainView, TerrainViewError};
@@ -152,7 +153,18 @@ impl Rules {
                 .any(|band| band.ys.contains(&y) && band.targets.contains(&state))
     }
 
-    pub(super) fn state(&self, pos: Pos, state: u32, read: impl Fn(Pos) -> Option<u32>) -> u32 {
+    pub(super) fn covers(&self, state: Option<u32>) -> bool {
+        state.map_or(self.spec.unavailable_occludes, |s| {
+            self.occluding.contains(&s)
+        })
+    }
+
+    pub(super) fn state(
+        &self,
+        pos: Pos,
+        state: u32,
+        mut read: impl FnMut(Pos) -> Option<u32>,
+    ) -> u32 {
         let (x, y, z) = pos;
         if !self.targets.contains(&state) {
             return state;
@@ -164,11 +176,10 @@ impl Rules {
         else {
             return state;
         };
-        if !FACES.iter().all(|&face| {
-            read(offset(pos, face)).map_or(self.spec.unavailable_occludes, |s| {
-                self.occluding.contains(&s)
-            })
-        }) {
+        if !FACES
+            .iter()
+            .all(|&face| self.covers(read(offset(pos, face))))
+        {
             return state;
         }
         if band.replacements.len() == 1 {
@@ -197,6 +208,74 @@ pub(super) type Neighbours = [Option<Arc<Chunk>>; 4];
 
 pub(super) fn neighbours(world: &World, (x, z): Column) -> Neighbours {
     HORIZONTAL.map(|(dx, dz)| world.chunks.get(&(x + dx, z + dz)).cloned())
+}
+
+/// The cells on adjacent faces whose authoritative states this projection actually read.
+pub(super) struct Faces([Face; 4]);
+
+struct Face {
+    stamp: Option<Weak<Chunk>>,
+    reads: Vec<FaceRead>,
+}
+
+struct FaceRead {
+    y: i32,
+    along: u8,
+    covered: bool,
+}
+
+fn current_chunk(chunk: Option<&Arc<Chunk>>, stamp: Option<&Weak<Chunk>>) -> bool {
+    chunk.map(Arc::as_ptr) == stamp.map(Weak::as_ptr)
+}
+
+impl Faces {
+    pub(super) fn new(neighbours: &Neighbours) -> Self {
+        Self(neighbours.each_ref().map(|c| Face {
+            stamp: c.as_ref().map(Arc::downgrade),
+            reads: Vec::new(),
+        }))
+    }
+
+    pub(super) fn read(&mut self, face: usize, (x, y, z): Pos, covered: bool) {
+        let along = (if face < 2 { z } else { x }) & 15;
+        self.0[face].reads.push(FaceRead {
+            y,
+            along: along as u8,
+            covered,
+        });
+    }
+
+    pub(super) fn current(&mut self, world: &World, rules: &Rules, at: Column) -> bool {
+        for (i, (key, face)) in adjacent(at).zip(&mut self.0).enumerate() {
+            if face.reads.is_empty() {
+                continue;
+            }
+            let chunk = world.chunks.get(&key);
+            if !current_chunk(chunk, face.stamp.as_ref()) {
+                if face.reads.iter().any(|read| {
+                    let along = i32::from(read.along);
+                    let (x, z) = match i {
+                        0 => (15, along),
+                        1 => (0, along),
+                        2 => (along, 15),
+                        _ => (along, 0),
+                    };
+                    rules.covers(chunk.and_then(|c| known(c, x, read.y, z))) != read.covered
+                }) {
+                    return false;
+                }
+                face.stamp = chunk.map(Arc::downgrade);
+            }
+        }
+        true
+    }
+
+    pub(super) fn bytes(&self) -> usize {
+        self.0
+            .iter()
+            .map(|face| face.reads.capacity() * std::mem::size_of::<FaceRead>())
+            .sum()
+    }
 }
 
 impl Selection {
@@ -317,28 +396,159 @@ impl Views {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Key(Arc<str>, u64, Column);
 
-type Identity = [Option<Weak<Chunk>>; 5];
+pub(in crate::lan) struct EncodeContext<'a> {
+    pub dimension: &'a str,
+    pub encoder: &'a ChunkEncoder,
+    pub world: &'a World,
+    pub protos: &'a dyn Fn(i32, i32) -> Option<SectionMask>,
+    pub include_far: bool,
+}
 
-fn identity(chunk: &Arc<Chunk>, neighbours: &Neighbours) -> Identity {
-    std::array::from_fn(|i| {
-        if i == 0 {
-            Some(Arc::downgrade(chunk))
+fn window(at: Column) -> impl Iterator<Item = Column> {
+    (-1..=1).flat_map(move |dz| (-1..=1).map(move |dx| (at.0 + dx, at.1 + dz)))
+}
+
+/// Light dependencies are occupancy masks. An interior edit or a relight in another column can
+/// move its allocation without changing which light sections this packet includes.
+struct LightStamp {
+    chunk: Option<Weak<Chunk>>,
+    proto: Option<SectionMask>,
+    occupied: SectionMask,
+}
+
+impl LightStamp {
+    fn update(&mut self, ctx: &EncodeContext<'_>, encoder: &TerrainEncoder, at: Column) {
+        let chunk = ctx.world.chunks.get(&at);
+        let proto = if chunk.is_none() {
+            (ctx.protos)(at.0, at.1)
         } else {
-            neighbours[i - 1].as_ref().map(Arc::downgrade)
+            None
+        };
+        if current_chunk(chunk, self.chunk.as_ref()) && self.proto == proto {
+            return;
         }
-    })
+        self.occupied = if let Some(chunk) = chunk {
+            ctx.encoder.occupied(chunk)
+        } else {
+            proto.map_or(SectionMask::EMPTY, |p| encoder.proto_occupied(p))
+        };
+        self.chunk = chunk.map(Arc::downgrade);
+        self.proto = proto;
+    }
+}
+
+fn occupancy(lights: &[LightStamp; 9]) -> SectionMask {
+    lights
+        .iter()
+        .fold(SectionMask::EMPTY, |mask, light| mask | light.occupied)
+}
+
+#[derive(Clone)]
+pub(super) enum Ready {
+    Ordinary,
+    Shared(Arc<TerrainBody>),
+}
+
+struct Cached {
+    chunk: Weak<Chunk>,
+    faces: Faces,
+    lights: [LightStamp; 9],
+    around: SectionMask,
+    encoder: TerrainEncoder,
+    ready: Ready,
+    include_far: bool,
+}
+
+impl Cached {
+    fn bytes(&self) -> usize {
+        self.faces.bytes()
+            + match &self.ready {
+                Ready::Ordinary => 0,
+                Ready::Shared(body) => body.bytes(),
+            }
+    }
+
+    fn current(&mut self, ctx: &EncodeContext<'_>, chunk: &Arc<Chunk>, rules: &Rules) -> bool {
+        let at = (chunk.x, chunk.z);
+        if !self.encoder.matches(ctx.encoder)
+            || Weak::as_ptr(&self.chunk) != Arc::as_ptr(chunk)
+            || !self.faces.current(ctx.world, rules, at)
+        {
+            return false;
+        }
+        if matches!(self.ready, Ready::Ordinary) {
+            return true;
+        }
+        for (at, light) in window(at).zip(&mut self.lights) {
+            light.update(ctx, &self.encoder, at);
+        }
+        self.around == occupancy(&self.lights) && (!ctx.include_far || self.include_far)
+    }
 }
 
 struct Job {
     key: Key,
-    identity: Identity,
     chunk: Arc<Chunk>,
-    neighbours: Neighbours,
+    columns: [Option<Arc<Chunk>>; 9],
+    protos: [Option<SectionMask>; 9],
     encoder: TerrainEncoder,
     rules: Arc<Rules>,
+    include_far: bool,
 }
 
-type Done = (Key, Identity, Arc<TerrainWires>);
+impl Job {
+    fn run(self, sections: &mut TerrainSections) -> (Key, Cached) {
+        let neighbours = [3, 5, 1, 7].map(|i| self.columns[i].clone());
+        let mut faces = Faces::new(&neighbours);
+        let wires = self
+            .encoder
+            .encode(&self.chunk, &neighbours, &self.rules, &mut faces);
+        let unchanged = wires.unchanged();
+        let lights = std::array::from_fn(|i| {
+            let chunk = self.columns[i].as_ref();
+            let proto = self.protos[i];
+            let occupied = if unchanged {
+                SectionMask::EMPTY
+            } else {
+                chunk.map_or_else(
+                    || proto.map_or(SectionMask::EMPTY, |p| self.encoder.proto_occupied(p)),
+                    |chunk| self.encoder.occupied(chunk),
+                )
+            };
+            LightStamp {
+                chunk: chunk.map(Arc::downgrade),
+                proto,
+                occupied,
+            }
+        });
+        let around = occupancy(&lights);
+        let ready = if unchanged {
+            Ready::Ordinary
+        } else {
+            Ready::Shared(Arc::new(self.encoder.body(
+                &self.chunk,
+                wires,
+                around,
+                self.include_far,
+                sections,
+            )))
+        };
+        (
+            self.key,
+            Cached {
+                chunk: Arc::downgrade(&self.chunk),
+                faces,
+                lights,
+                around,
+                encoder: self.encoder,
+                ready,
+                include_far: self.include_far,
+            },
+        )
+    }
+}
+
+type Done = (Key, Cached);
 
 struct Worker {
     jobs: mpsc::SyncSender<Job>,
@@ -358,13 +568,12 @@ impl Worker {
             started |= std::thread::Builder::new()
                 .name(format!("Terrain view encoder #{index}"))
                 .spawn(move || {
+                    let mut sections = TerrainSections::default();
                     loop {
                         let Ok(job) = work.lock().unwrap().recv() else {
                             return;
                         };
-                        let wires =
-                            Arc::new(job.encoder.encode(&job.chunk, &job.neighbours, &job.rules));
-                        if reply.send((job.key, job.identity, wires)).is_err() {
+                        if reply.send(job.run(&mut sections)).is_err() {
                             return;
                         }
                     }
@@ -380,13 +589,12 @@ pub(super) struct Resident {
     #[cfg(test)]
     pub(in crate::lan) submitted: usize,
     worker: Option<Worker>,
-    unchanged: Arc<TerrainWires>,
     dimension: Option<Arc<str>>,
     // Every candidate is checked or queued once per level pass, even while many guests share
     // the same queue at spawn. None means the work is still pending or the queue had no room.
-    pass: FxHashMap<Key, Option<Arc<TerrainWires>>>,
+    pass: FxHashMap<Key, Option<Ready>>,
     pending: FxHashSet<Key>,
-    cache: FxHashMap<Key, (Identity, Arc<TerrainWires>)>,
+    cache: FxHashMap<Key, Cached>,
     ordering: VecDeque<Key>,
     bytes: usize,
 }
@@ -397,13 +605,13 @@ impl Resident {
         let Some(worker) = self.worker.as_ref() else {
             return;
         };
-        while let Ok((key, identity, result)) = worker.done.try_recv() {
+        while let Ok((key, result)) = worker.done.try_recv() {
             self.pending.remove(&key);
             self.bytes += result.bytes();
-            self.cache.insert(key.clone(), (identity, result));
+            self.cache.insert(key.clone(), result);
             self.ordering.push_back(key);
             while self.bytes > CACHE_BYTES || self.cache.len() > CACHE_COLUMNS {
-                if let Some((_, old)) = self
+                if let Some(old) = self
                     .ordering
                     .pop_front()
                     .and_then(|k| self.cache.remove(&k))
@@ -414,70 +622,69 @@ impl Resident {
         }
     }
 
+    pub(super) fn can_queue(&self) -> bool {
+        self.pending.len() < IN_FLIGHT
+    }
+
+    pub(super) fn can_warm(&self) -> bool {
+        self.pending.len() < IN_FLIGHT / 2
+    }
+
     pub(super) fn get(
         &mut self,
-        dimension: &str,
-        encoder: &ChunkEncoder,
-        rules: Arc<Rules>,
-        world: &World,
+        ctx: &EncodeContext<'_>,
+        rules: &Arc<Rules>,
         at: Column,
-    ) -> Option<Arc<TerrainWires>> {
-        if self.dimension.as_deref() != Some(dimension) {
-            self.dimension = Some(Arc::from(dimension));
+    ) -> Option<Ready> {
+        if self.dimension.as_deref() != Some(ctx.dimension) {
+            self.dimension = Some(Arc::from(ctx.dimension));
         }
         let key = Key(
             self.dimension.as_ref().unwrap().clone(),
             rules.generation,
             at,
         );
-        if let Some(wires) = self.pass.get(&key) {
-            return wires.clone();
+        if let Some(ready) = self.pass.get(&key) {
+            return ready.clone();
         }
-        let wires = self.lookup(&key, encoder, rules, world);
+        let ready = self.lookup(&key, ctx, rules);
         if self.pass.len() < CACHE_COLUMNS {
-            self.pass.insert(key, wires.clone());
+            self.pass.insert(key, ready.clone());
         }
-        wires
+        ready
     }
 
-    fn lookup(
-        &mut self,
-        key: &Key,
-        encoder: &ChunkEncoder,
-        rules: Arc<Rules>,
-        world: &World,
-    ) -> Option<Arc<TerrainWires>> {
+    fn lookup(&mut self, key: &Key, ctx: &EncodeContext<'_>, rules: &Arc<Rules>) -> Option<Ready> {
         let at = key.2;
-        let chunk = world.chunks.get(&at)?;
-        if let Some((old, wires)) = self.cache.get(key) {
-            let current = std::iter::once(Some(chunk))
-                .chain(adjacent(at).map(|next| world.chunks.get(&next)));
-            if current.zip(old).all(|(chunk, stamp)| match (chunk, stamp) {
-                (None, None) => true,
-                (Some(chunk), Some(stamp)) => Arc::as_ptr(chunk) == Weak::as_ptr(stamp),
-                _ => false,
-            }) {
-                return Some(wires.clone());
+        let chunk = ctx.world.chunks.get(&at)?;
+        if let Some(cached) = self.cache.get_mut(key) {
+            if cached.current(ctx, chunk, rules) {
+                return Some(cached.ready.clone());
             }
-            self.bytes -= wires.bytes();
+            self.bytes -= cached.bytes();
             self.cache.remove(key);
             self.ordering.retain(|k| k != key);
         }
         if self.pending.contains(key) {
             return None;
         }
-        // With no eligible state in this column, neighbours cannot change its view.
-        // Use the ordinary section cache without waiting for encoder capacity.
-        if !encoder.terrain_eligible(chunk, &rules) {
-            return Some(self.unchanged.clone());
+        if !ctx.encoder.terrain_eligible(chunk, rules) {
+            return Some(Ready::Ordinary);
         }
-        if self.pending.len() == IN_FLIGHT {
+        if !self.can_queue() {
             return None;
         }
-        let neighbours = neighbours(world, at);
-        let keys = identity(chunk, &neighbours);
         if self.worker.is_none() {
             self.worker = Worker::start();
+        }
+        let mut columns = std::array::from_fn(|_| None);
+        let mut protos = [None; 9];
+        for (i, at) in window(at).enumerate() {
+            if let Some(chunk) = ctx.world.chunks.get(&at) {
+                columns[i] = Some(chunk.clone());
+            } else {
+                protos[i] = (ctx.protos)(at.0, at.1);
+            }
         }
         if self
             .worker
@@ -485,11 +692,12 @@ impl Resident {
             .jobs
             .try_send(Job {
                 key: key.clone(),
-                identity: keys,
                 chunk: chunk.clone(),
-                neighbours,
-                encoder: encoder.terrain_encoder(),
-                rules,
+                columns,
+                protos,
+                encoder: ctx.encoder.terrain_encoder(),
+                rules: rules.clone(),
+                include_far: ctx.include_far,
             })
             .is_ok()
         {

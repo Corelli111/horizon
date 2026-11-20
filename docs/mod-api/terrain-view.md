@@ -31,8 +31,12 @@ lists, height and dimension conditions, seed, treatment of missing faces, reveal
 Evaluating the terrain rules requires no worker call into the mod. [Paper's Anti-Xray modes](https://docs.papermc.io/paper/anti-xray/)
 
 The server thread validates and prepares rule definitions and decides which view applies. Workers
-receive immutable chunk snapshots and rules. Players using the same rule snapshot share
-transforms and bodies during a send pass. Identical definitions use the same snapshot. Bounded queues and caches can defer a send. A pending protected
+receive immutable chunk snapshots and rules. Workers finish and cache the packet across
+send passes. Players using the same rule snapshot share the bytes. Identical definitions
+use the same snapshot. A packet with visible block entities gets its live tags when sent.
+Nearby ready columns are prepared ahead of demand, with space reserved for regular sends.
+Interior edits in a neighbour keep the cached packet when the faces the transform read and the
+light occupancy mask still match. Bounded queues and caches can defer a send. A pending protected
 column is never replaced by an ordinary body. Lighting, heightmaps and biomes describe the
 authoritative terrain. The separate Horizon LOD service withholds replies for a protected dimension
 because its top, under-surface and vertical span samples carry authoritative state IDs.

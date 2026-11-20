@@ -207,6 +207,11 @@ fn terrain_views_filter_shared_batches_deltas_metadata_and_corrections() {
         assert_eq!(section_state(chunk, CHEST), if i < 2 { 1 } else { 2 });
         assert_eq!(chunk.chunk.block_entities.len(), if i < 2 { 0 } else { 2 });
     }
+    let protected = initial(&packets[0]).unwrap();
+    let bypass = initial(&packets[2]).unwrap();
+    assert_eq!(protected.light.sky, bypass.light.sky);
+    assert_eq!(protected.light.block, bypass.light.block);
+    assert_eq!(protected.chunk.heightmaps, bypass.chunk.heightmaps);
     // The protected pair selected one view and got the same prepared body.
     assert_eq!(
         initial(&packets[0]).unwrap().chunk.buffer,
@@ -438,4 +443,53 @@ fn validated_break_reveal_is_bounded_and_sticks_to_the_actor() {
         );
         assert_eq!(packets.iter().find_map(|p| update_state(p, CHEST)), Some(1));
     }
+}
+
+#[test]
+fn resident_terrain_reuses_body_after_an_interior_edit_and_reads_live_tags() {
+    let (mut hub, rx, mut world) = setup();
+    // The machine stays visible while the chest continues to depend on the neighboring face.
+    Arc::make_mut(world.chunks.get_mut(&(0, 0)).unwrap()).set(11, 64, 1, 0);
+    let first = wait_for_chunks(&mut hub, &mut world, &[&rx[0]]);
+    let first = initial(&first[0]).unwrap();
+    assert_eq!(section_state(first, CHEST), 1);
+    let machine_tag = |p: &play::LevelChunkWithLight| {
+        p.chunk
+            .block_entities
+            .iter()
+            .find(|tag| tag.kind == 49)
+            .and_then(|tag| tag.tag.get("persisted"))
+            .cloned()
+    };
+    assert_eq!(machine_tag(first), Some(Tag::Int(7)));
+    assert_eq!(hub.terrain.as_ref().unwrap().resident.submitted, 1);
+
+    // This changes the neighboring allocation but neither a consulted face nor its occupancy.
+    Arc::make_mut(world.chunks.get_mut(&(1, 0)).unwrap()).set(4, 64, 4, 1);
+    world.block_entities.insert(
+        tuple(MACHINE),
+        BlockEntity::Mod(Box::new(ModBlockEntity::new(
+            "test:machine".into(),
+            ModBlockEntityFields {
+                nbt: Compound::from([("persisted".into(), Tag::Int(8))]),
+                ..Default::default()
+            },
+        ))),
+    );
+    let resend = |hub: &mut Hub, world: &mut World| {
+        hub.set_terrain_view(1, DIM, "test", None).unwrap();
+        hub.set_terrain_view(1, DIM, "test", Some(1)).unwrap();
+        wait_for_chunks(hub, world, &[&rx[0]])
+    };
+    let again = resend(&mut hub, &mut world);
+    let again = initial(&again[0]).unwrap();
+    assert_eq!(first.chunk.buffer, again.chunk.buffer);
+    assert_eq!(machine_tag(again), Some(Tag::Int(8)));
+    assert_eq!(hub.terrain.as_ref().unwrap().resident.submitted, 1);
+
+    // Now the same send genuinely depends on a changed face.
+    Arc::make_mut(world.chunks.get_mut(&(1, 0)).unwrap()).set(0, 64, 1, 0);
+    let exposed = resend(&mut hub, &mut world);
+    assert_eq!(section_state(initial(&exposed[0]).unwrap(), CHEST), 2);
+    assert_eq!(hub.terrain.as_ref().unwrap().resident.submitted, 2);
 }
