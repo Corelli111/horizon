@@ -164,14 +164,21 @@ class ClientOutput:
         self.lines.put(None)
 
     def _next(self, deadline, what):
+        """The next line, or the failure `what` once the monotonic `deadline` has passed: checked before every
+        dequeue, so neither a backlog nor a client that keeps printing can carry a wait past it."""
+        if deadline is None:
+            return self.lines.get()
+        remaining = deadline - time.monotonic()
         try:
-            return self.lines.get(timeout=None if deadline is None else max(0.0, deadline - time.time()))
+            if remaining <= 0:
+                raise queue.Empty
+            return self.lines.get(timeout=remaining)
         except queue.Empty:
             raise AssertionError(f'{self.label}: {what}') from None
 
     def expect(self, wanted, timeout=None):
         """Waits for the line `wanted` (no newline), for at most `timeout` s if given."""
-        deadline = None if timeout is None else time.time() + timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
         while (line := self._next(deadline, f'no {wanted!r} from the client in {timeout} s')) != wanted + '\n':
             if line is None:
                 raise AssertionError(f'{self.label}: the client exited')
@@ -179,9 +186,18 @@ class ClientOutput:
 
     def drain(self, timeout):
         """Everything the client prints until it exits, into its log."""
-        deadline = time.time() + timeout
+        deadline = time.monotonic() + timeout
         while (line := self._next(deadline, f'the client did not exit in {timeout} s')) is not None:
             self.log.write(line)
+
+
+def keep_snapshot(out, snapshot):
+    """Puts the transcript text `snapshot` back at `out`, and what the client wrote there since under
+    `<name>-end.txt`: the compared transcript is the file the report hashes and a failure names. Returns its lines."""
+    if out.exists():
+        out.replace(out.with_name(f'{out.stem}-end{out.suffix}'))
+    out.write_text(snapshot, encoding='utf-8')
+    return snapshot.splitlines()
 
 
 class Client:
@@ -375,19 +391,22 @@ def one_player(name, script, shown, check, scope, step_seconds=4.0, facts=None):
                         # What is compared is this snapshot, taken before the diagnostics: they can't change it.
                         try:
                             session.dump(10)
-                            snapshot = out.read_text(encoding='utf-8').splitlines()
+                            snapshot = out.read_text(encoding='utf-8')
                         except (AssertionError, OSError) as error:
                             seen[label] = f'diagnostics unavailable ({error})'
                         else:
-                            seen[label] = sample(server, snapshot, expected)
+                            seen[label] = sample(server, snapshot.splitlines(), expected)
                     session.end()
                 finally:
                     session.kill()
         finally:
             server.stop()
+        if snapshot is not None:
+            # The diff, the failure message and the report's hash all use the snapshot, not what `end` rewrote.
+            return keep_snapshot(out, snapshot)
         if not out.exists():
             raise AssertionError(f'{label}: the client wrote no transcript (see {build}/{label}-client.log)')
-        return snapshot if snapshot is not None else out.read_text(encoding='utf-8').splitlines()
+        return out.read_text(encoding='utf-8').splitlines()
 
     seen = {}
     world = generate_world(vanilla_server, build)
