@@ -396,11 +396,16 @@ struct Region {
     start: usize,
     end: usize,
     read_write: bool,
+    /// Who made it (<mach/vm_statistics.h>): stacks are `VM_MEMORY_STACK`.
+    user_tag: u32,
 }
 
-/// The size of the stack holding `anchor`: from the end of the readable and writable region that
-/// holds it down through the ones directly below it, to the first gap or guard (a stack's lowest
-/// page is a guard). Stops early once `enough` is reached. `region(address)` is the region holding
+#[cfg(any(target_vendor = "apple", test))]
+const VM_MEMORY_STACK: u32 = 30;
+
+/// The size of the stack holding `anchor`: from the end of the readable and writable stack region
+/// that holds it down through the ones directly below it, to the first gap, guard or region that
+/// isn't a stack's. Stops early once `enough` is reached. `region(address)` is the region holding
 /// `address`, or the next one above it when none does.
 #[cfg(any(target_vendor = "apple", test))]
 fn mapped_stack(
@@ -414,11 +419,21 @@ fn mapped_stack(
             "no readable and writable region holds the stack address {anchor:#x}"
         ));
     }
+    if holding.user_tag != VM_MEMORY_STACK {
+        return Err(format!(
+            "the region holding the stack address {anchor:#x} has user tag {}, not a stack's",
+            holding.user_tag
+        ));
+    }
     let mut bottom = holding.start;
     while holding.end - bottom < enough && bottom > 0 {
         let below = region(bottom - 1)?;
         // A region that doesn't end at `bottom` doesn't hold `bottom - 1`: a gap.
-        if below.end != bottom || below.start >= bottom || !below.read_write {
+        if below.end != bottom
+            || below.start >= bottom
+            || !below.read_write
+            || below.user_tag != VM_MEMORY_STACK
+        {
             break;
         }
         bottom = below.start;
@@ -428,9 +443,9 @@ fn mapped_stack(
 
 #[cfg(target_vendor = "apple")]
 fn vm_region(address: usize) -> Result<Region, String> {
-    // <mach/vm_region.h>: the flavor, and its info's size in ints (vm_region_basic_info_64 is
-    // packed to 4 bytes: 36 bytes). Its first field is the region's current protection.
-    const VM_REGION_BASIC_INFO_64: libc::c_int = 9;
+    // <mach/vm_region.h>: the flavor, and its info's size in ints (vm_region_extended_info is
+    // packed to 4 bytes: 36 bytes). It starts with the current protection, then the user tag.
+    const VM_REGION_EXTENDED_INFO: libc::c_int = 13;
     let mut info: [libc::c_int; 9] = [0; 9];
     let mut count = info.len() as u32;
     let mut start = address as u64;
@@ -442,7 +457,7 @@ fn vm_region(address: usize) -> Result<Region, String> {
             mach_task_self_,
             &mut start,
             &mut size,
-            VM_REGION_BASIC_INFO_64,
+            VM_REGION_EXTENDED_INFO,
             info.as_mut_ptr(),
             &mut count,
             &mut object_name,
@@ -456,6 +471,7 @@ fn vm_region(address: usize) -> Result<Region, String> {
         start: start as usize,
         end: start.saturating_add(size) as usize,
         read_write: info[0] & read_write == read_write,
+        user_tag: info[1] as u32,
     })
 }
 
@@ -641,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn the_mapped_stack_ends_at_a_guard_or_a_gap() {
+    fn the_mapped_stack_ends_at_a_guard_a_gap_or_another_mapping() {
         use super::Region;
         const MIB: usize = 1024 * 1024;
         let needed = super::GUEST_STACK_BYTES + super::HOST_HEADROOM;
@@ -656,10 +672,18 @@ mod tests {
                     .ok_or_else(|| "none above".to_owned())
             }
         };
+        // A stack's region; `other` is an anonymous mapping (user tag 0).
         let region = |start, end, read_write| Region {
             start,
             end,
             read_write,
+            user_tag: super::VM_MEMORY_STACK,
+        };
+        let other = |start, end| Region {
+            start,
+            end,
+            read_write: true,
+            user_tag: 0,
         };
         let anchor = top - 64 * 1024;
         // A linked 136 MiB stack in one region, its guard page below.
@@ -697,6 +721,18 @@ mod tests {
             region(top - 8 * MIB, top, true),
         ];
         assert_eq!(super::mapped_stack(anchor, needed, query(gap)), Ok(8 * MIB));
+        // So does a writable mapping right below that isn't a stack's.
+        let abutting = vec![
+            other(0x1000, top - 8 * MIB),
+            region(top - 8 * MIB, top, true),
+        ];
+        assert_eq!(
+            super::mapped_stack(anchor, needed, query(abutting)),
+            Ok(8 * MIB)
+        );
+        // An anchor in a region that isn't a stack's is not measured.
+        let untagged = vec![other(top - needed, top)];
+        assert!(super::mapped_stack(anchor, needed, query(untagged)).is_err());
         // The anchor in no region, or in a guard, is not measured.
         let below = vec![region(top - 8 * MIB, top, true)];
         assert!(super::mapped_stack(top - 9 * MIB, needed, query(below)).is_err());
