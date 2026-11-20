@@ -245,7 +245,7 @@ def main():
     oracle = ['java', '-Xmx1G', '-cp', str(classes) + os.pathsep + dependencies, 'dev.horizonlab.parity.VanillaScoreboardOracle']
     run(['javac', '--release', lock['minecraft']['java_major'], '-proc:none', '-nowarn', '-cp', dependencies, '-d', classes,
          PARITY / 'VanillaScoreboardOracle.java'], 'compile-java')
-    export = oracle_folders.folder(build / 'oracle-export')
+    export = oracle_folders.folder(build / 'oracle-export', call=(classes, jars['server'], 'export'))
     run([*oracle, 'export', export], 'export')
     oracle_folders.copy(export, build, 'registries.json')
     registries = json.loads((build / 'registries.json').read_text())

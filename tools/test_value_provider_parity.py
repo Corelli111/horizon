@@ -81,7 +81,8 @@ def main():
     run([binary,"value_provider_fixture",build],"rust")
     references=[]
     for side,jar in jars.items():
-        folder=oracle_folders.folder(build/f"oracle-{side}",*fixture_paths)
+        (build/f"{side}.txt").unlink(missing_ok=True)  # the layout before: the reference beside the work files
+        folder=oracle_folders.folder(build/f"oracle-{side}",*fixture_paths,call=(classes,jar,side))
         reference=folder/f"{side}.txt"
         run(["java","-Xmx512M","-cp",os.pathsep.join([str(classes),str(jar),dependency_path]),"dev.horizonlab.parity.VanillaValueProviderOracle",side,folder],side)
         matched=base.compare(reference,build/"rust.txt")

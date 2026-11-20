@@ -40,13 +40,11 @@ def main():
     lock, jars, libraries = test_rust_parity.verify_artifacts()
     for earlier in directory.glob("run-*"):  # the folders of the layout before, one per run
         shutil.rmtree(earlier, ignore_errors=True)
-    # Folders of stable names: an oracle call is replayed only when its command line repeats (tools/parity_shim.py).
-    # Each call's folder is kept between runs (tools/oracle_folders.py); the Rust side's starts empty.
+    # Each oracle call has a folder of its own, the same while the call is (tools/oracle_folders.py), and the Rust
+    # side's starts empty.
     rust = directory / "rust"
     shutil.rmtree(rust, ignore_errors=True)
     rust.mkdir()
-    generated = oracle_folders.folder(directory / "oracle-generate")
-    inputs = generated / "inputs.txt"
     oracle = lab.ROOT / "mods/horizon/src/test/java/dev/horizonlab/parity/VanillaCollisionOracle.java"
     sources = [oracle, Path(__file__).resolve(), lab.ROOT / "tools/test_rust_parity.py", lab.ROOT / "Cargo.toml", lab.ROOT / "Cargo.lock", lab.ROOT / "crates/horizon-core/Cargo.toml", lab.ROOT / "crates/horizon-world/Cargo.toml", *sorted((lab.ROOT / "crates/horizon-core/src").rglob("*.rs")), *sorted((lab.ROOT / "crates/horizon-world/src").rglob("*.rs")), lab.ROOT / "crates/horizon-world/examples/probe/collision_fixture.rs"]
     tested_sources = test_rust_parity.source_hashes(sources)
@@ -59,6 +57,8 @@ def main():
         (directory / f"{side}-{mode}.log").write_text(result.stdout + result.stderr, encoding="utf-8")
         result.check_returncode()
         return result.stdout
+    generated = oracle_folders.folder(directory / "oracle-generate", call=(classes, jars["server"], "generate"))
+    inputs = generated / "inputs.txt"
     expected = counts(java("server", "generate", generated))
     test_rust_parity.run(["cargo", "build", "--release", "-p", "horizon-world", "--example", "world_probe"])
     metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"], cwd=lab.ROOT, text=True))
@@ -76,7 +76,7 @@ def main():
     if sum(canonical.values()) != expected['cached_states']: raise AssertionError('incomplete canonical identity comparison')
     references = []
     for side, jar in jars.items():
-        folder = oracle_folders.folder(directory / f"oracle-{side}", inputs)
+        folder = oracle_folders.folder(directory / f"oracle-{side}", inputs, call=(classes, jars[side], side))
         java(side, side, folder)
         (folder / "inputs.txt").unlink()  # 62 MB, copied in again before the next run's call
         reference = folder / f"vanilla-{side}.txt"

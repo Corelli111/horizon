@@ -59,7 +59,7 @@ def main():
     run(['javac','--release',lock['minecraft']['java_major'],'-proc:none','-sourcepath',str(lab.ROOT/'mods/horizon/src/test/java'),'-cp',str(jars['server'])+os.pathsep+dependency_path,'-d',classes,oracle,*helpers],'compile-java')
     def java(side,mode,path):
         run(['java','-Xmx512M','-cp',os.pathsep.join([str(classes),str(jars[side]),dependency_path]),'dev.horizonlab.parity.VanillaPistonShapeOracle',mode,path],side+'-'+mode)
-    export=oracle_folders.folder(build/'oracle-export');java('server','export',export)
+    export=oracle_folders.folder(build/'oracle-export',call=(classes,jars['server'],'export'));java('server','export',export)
     oracle_folders.copy(export,build,'facts.json','block-registry.nbt','cached-collision.nbt')
     facts=json.loads((build/'facts.json').read_text())
     if len(facts['states'])!=35723:raise ValueError('incomplete pinned registry')
@@ -70,7 +70,8 @@ def main():
     binary=Path(metadata['target_directory'])/'release/examples'/('world_probe.exe' if os.name=='nt' else 'world_probe')
     run([binary,'piston_shape_fixture',build],'rust');references=[]
     for side,jar in jars.items():
-        folder=oracle_folders.folder(build/f'oracle-{side}',*fixture_paths);java(side,side,folder);reference=folder/f'{side}.txt';matched=base.compare(reference,build/'rust.txt')
+        (build/f'{side}.txt').unlink(missing_ok=True)  # the layout before: the reference beside the work files
+        folder=oracle_folders.folder(build/f'oracle-{side}',*fixture_paths,call=(classes,jars[side],side));java(side,side,folder);reference=folder/f'{side}.txt';matched=base.compare(reference,build/'rust.txt')
         references.append({'side':side,'jar_sha256':lab.digest(jar,'sha256'),'output_sha256':lab.digest(reference,'sha256'),'matched_output_lines':matched})
         print(f'{side}: {matched:,} piston-shape output lines match Rust',flush=True)
     base.ensure_sources_unchanged(sources,tested_sources);base.ensure_sources_unchanged(fixture_paths,tested_fixtures)

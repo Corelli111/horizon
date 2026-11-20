@@ -107,7 +107,8 @@ def main():
     run([binary,"heightmap_fixture",build],"rust")
     references=[]
     for side,jar in jars.items():
-        folder=oracle_folders.folder(build/f"oracle-{side}",*fixture_paths)
+        (build/f"{side}.txt").unlink(missing_ok=True)  # the layout before: the reference beside the work files
+        folder=oracle_folders.folder(build/f"oracle-{side}",*fixture_paths,call=(classes,jars[side],side))
         java(side,side,folder)
         reference=folder/f"{side}.txt";matched=base.compare(reference,build/"rust.txt")
         references.append({"side":side,"jar_sha256":lab.digest(jar,"sha256"),"output_sha256":lab.digest(reference,"sha256"),"matched_output_lines":matched})
