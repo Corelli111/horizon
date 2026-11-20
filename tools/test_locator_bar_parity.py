@@ -23,6 +23,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import threading
 
 try:
     from . import lab, test_rust_parity as base
@@ -178,6 +179,20 @@ class Client:
         wait_ticks(server, ticks)
         self.sync(names)
 
+    def dump(self, timeout):
+        """Has the client write its transcript so far: True once it says it has, False after `timeout` s."""
+        self.tell('dump now')
+        done = threading.Event()
+
+        def read():
+            while line := self.process.stdout.readline():
+                if line == 'dumped now\n':
+                    done.set()
+                    return
+                self.log.write(line)
+        threading.Thread(target=read, daemon=True).start()
+        return done.wait(timeout)
+
     def end(self):
         self.tell('end')
         self.log.write(self.process.communicate(timeout=60)[0])
@@ -279,12 +294,24 @@ def one_player(name, script, shown, check, scope, step_seconds=4.0, facts=None):
     """A harness of one player, Alice: on each server she joins, then runs `script`, a list of (step, client
     actions) that each last `step_seconds` of the server's time (20 ticks a second). The lines `shown(transcript)` keeps must match vanilla's exactly, and
     `check(vanilla's shown lines, vanilla's transcript)` returns why vanilla's run is no proof (the script did
-    not run), or None. `facts(server)`, if given, is asked after the script while Alice is still there, and what it
-    returns for each side is printed when they differ."""
+    not run), or None. `facts(server)`, if given, gathers diagnostics from the console while Alice is still there,
+    only for the run that matters: vanilla's run `check` accepts, and Horizon's when its lines differ from vanilla's.
+    They are printed with a mismatch, and can never fail or change the comparison."""
     lock, build, vanilla_server, horizon_server, client = sides(name)
     ticks = round(step_seconds * 20)
 
-    def run(label, server_command, world):
+    def sample(server, session, out, expected):
+        """`facts(server)` when this run's transcript so far calls for it (see above), else None."""
+        try:
+            if not session.dump(10):
+                return 'diagnostics unavailable (no transcript from the client in 10 s)'
+            lines = out.read_text(encoding='utf-8').splitlines()
+            wanted = check(shown(lines), lines) is None if expected is None else shown(lines) != expected
+            return facts(server) if wanted else None
+        except Exception as error:  # diagnostics never decide the outcome
+            return f'diagnostics unavailable ({error!r})'[:300]
+
+    def run(label, server_command, world, expected=None):
         directory = build / label
         port = server_dir(directory, world)
         out = build / f'{label}.txt'
@@ -304,7 +331,7 @@ def one_player(name, script, shown, check, scope, step_seconds=4.0, facts=None):
                         for action in actions:
                             session.tell(action)
                         session.wait(server, ['Alice'], ticks)
-                    seen[label] = facts(server) if facts else None
+                    seen[label] = sample(server, session, out, expected) if facts else None
                     session.end()
                 finally:
                     session.kill()
@@ -327,7 +354,7 @@ def one_player(name, script, shown, check, scope, step_seconds=4.0, facts=None):
         print(f'{name}: vanilla run {attempt} of {VANILLA_ATTEMPTS} is no proof ({why})', flush=True)
     else:
         raise AssertionError(f'{why}: the script did not run on vanilla in {VANILLA_ATTEMPTS} runs (see {build})')
-    horizon_all = run('horizon', horizon_server, world)
+    horizon_all = run('horizon', horizon_server, world, expected=shown(vanilla_all))
     errors = [l for l in vanilla_all + horizon_all if ' error ' in f' {l} ' or 'disconnected' in l]
     vanilla, horizon = shown(vanilla_all), shown(horizon_all)
     if errors or vanilla != horizon:

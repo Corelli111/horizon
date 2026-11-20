@@ -28,13 +28,13 @@ try:
     from . import lab, test_rust_parity as base
     from .test_dedicated_server_parity import Server, game_time, wait_ticks
     from .test_locator_bar_parity import generate_world
-    from .test_server_knockback_parity import server_dir
+    from .test_server_knockback_parity import frozen, left, server_dir
 except ImportError:
     import lab
     import test_rust_parity as base
     from test_dedicated_server_parity import Server, game_time, wait_ticks
     from test_locator_bar_parity import generate_world
-    from test_server_knockback_parity import server_dir
+    from test_server_knockback_parity import frozen, left, server_dir
 
 NAME = 'server-wool-vibration-parity'
 KNOWN = {}
@@ -80,16 +80,24 @@ def drop(x, ground, height=1.25):
         lines += at(x, y, False)
 
 
-def walk(x, ground):
-    """Twenty positions 0.2 blocks apart, one a game tick, with ticking frozen (player_case) and stepped once per
-    position: the step's vibration and the read 12 ticks after the last position land on the same ticks on both
-    servers. In real time the read came within a few ticks of the end of the sensor's 30 active ticks (ticks 11 to
-    40 after the first position on both servers, stepped), and missed it on a loaded machine (#18133)."""
-    lines = []
-    for i in range(1, 21):
-        x_i = round(x + 0.2 * i, 3)
-        lines += [f'pos Alice {x_i} {ground} {START[1]} 0 0 1', f'moved {x_i} {ground}', 'tickstep 1']
-    return lines
+# Stepped ticks a walk is read over: its sensor (on stone) goes active at tick 11 after the first position, cooldown
+# at 41 and inactive at 51 on both servers (#18133), so this covers the whole cycle and nine quiet ticks after it.
+WALK_TICKS = 60
+
+
+def walk(x, ground, case):
+    """Twenty positions 0.2 blocks apart, one a game tick, with ticking frozen and stepped once a tick, and after every
+    stepped tick the sensor's frequency and phase, filed under `case#tNN`: compared tick by tick, which pins when the
+    sensor turns on, its 30 active and 10 cooldown ticks and its return to inactive. Real time read the phase once,
+    a few ticks before the end of the active ticks (#18133). A stepped walk no longer covers when a server applies a
+    position packet relative to its ticks: each position is confirmed applied (`moved`) before the tick runs."""
+    lines = ['freeze']
+    for tick in range(1, WALK_TICKS + 1):
+        if tick <= 20:
+            x_i = round(x + 0.2 * tick, 3)
+            lines += [f'pos Alice {x_i} {ground} {START[1]} 0 0 1', f'moved {x_i} {ground}']
+        lines += ['tickstep', f'step {case}#t{tick:02d}', FREQUENCY, PHASE, COOLDOWN]
+    return lines + ['unfreeze']
 
 
 def arena(floor):
@@ -114,6 +122,8 @@ def sensor(shrieker=False):
 FREQUENCY = f'cmd Alice data get block {SENSOR[0]} {SENSOR[1]} {SENSOR[2]} last_vibration_frequency'
 PHASE = (f'cmd Alice execute if block {SENSOR[0]} {SENSOR[1]} {SENSOR[2]} '
          'minecraft:sculk_sensor[sculk_sensor_phase=active]')
+COOLDOWN = (f'cmd Alice execute if block {SENSOR[0]} {SENSOR[1]} {SENSOR[2]} '
+            'minecraft:sculk_sensor[sculk_sensor_phase=cooldown]')
 SHRIEKING = (f'cmd Alice execute if block {SHRIEKER[0]} {SHRIEKER[1]} {SHRIEKER[2]} '
              'minecraft:sculk_shrieker[shrieking=true]')
 
@@ -127,18 +137,17 @@ def player_case(case, floor, action, sneak=False, shrieker=False):
     if sneak:
         lines += ['sneak Alice on', 'sleep 0.1']
     lines += [*sensor(shrieker), 'ticks 5', f'step {case}', FREQUENCY]
-    stepped = action is walk
     if action == 'hurt':
         lines.append('cmd Alice damage @s 1 minecraft:generic')
-    elif stepped:
-        lines += ['freeze', *action(x, ground)]
+    elif action is walk:
+        STEPPED.add(case)
+        lines += walk(x, ground, case)
     else:
         lines += action(x, ground)
-    lines += ['tickstep 12' if stepped else 'ticks 12', FREQUENCY, PHASE]
+    if action is not walk:
+        lines += ['ticks 12', FREQUENCY, PHASE]
     if shrieker:
         lines.append(SHRIEKING)
-    if stepped:
-        lines.append('unfreeze')
     lines += ['step setup', 'cmd Alice effect give @s minecraft:instant_health 1 5 true']
     if sneak:
         lines += ['sneak Alice off', 'sleep 0.1']
@@ -153,6 +162,7 @@ def entity_case(case, floor, summon):
             'step setup']
 
 
+STEPPED = set()  # the cases player_case reads tick by tick
 COW = 'minecraft:cow {pos} {{active_effects:[{{id:"minecraft:slowness",amplifier:127b,duration:1000}}]}}'
 CASES = {}
 for floor_name in ('stone', 'wool', 'carpet', 'slab'):
@@ -223,6 +233,8 @@ def run_side(label, server_command, client_command, build, world):
                         raise AssertionError(f'{label}: the client exited (see {build}/{label}-client.log)')
                     log.write(reply)
 
+            clock = [None]  # the frozen game clock while a walk is stepped
+
             def send(line):
                 word = line.split()[0]
                 if word == 'sleep':
@@ -233,36 +245,39 @@ def run_side(label, server_command, client_command, build, world):
                     wait_ticks(server, int(line.split()[1]))
                     sync()
                 elif word == 'freeze':
-                    # Frozen once the tick in flight has finished: the clock reads the same twice.
                     sync()
                     server.console('tick freeze')
-                    while game_time(server) != game_time(server):
-                        pass
+                    clock[0] = frozen(server)
                 elif word == 'unfreeze':
                     # After the reads before it have run: `cmd` lines are only queued on the client.
                     sync()
                     server.console('tick unfreeze')
                     sync()
+                    clock[0] = None
                 elif word == 'moved':
                     # A frozen server may apply a position in the player's next tick, not when it arrives.
                     sync()
                     x, y = map(float, line.split()[1:3])
                     deadline = time.time() + 30
-                    while (pos := position(server)) is None or abs(pos[0] - x) > 1e-6 or abs(pos[1] - y) > 1e-6:
-                        if time.time() > deadline:
-                            raise AssertionError(f'{label}: Alice is at {pos}, not at x {x} y {y}, 30 s after moving')
+                    failure = f'{label}: Alice was not at x {x} y {y} 30 s after moving'
+                    while (pos := position(server, min(2.0, left(deadline, failure)))) is None \
+                            or abs(pos[0] - x) > 1e-6 or abs(pos[1] - y) > 1e-6:
+                        left(deadline, f'{failure} (at {pos})')
                         time.sleep(0.02)
                 elif word == 'tickstep':
-                    # `/tick step N` answers at once and the ticks run after: the clock says when they have.
+                    # One `/tick step 1` from the frozen clock: it answers at once and the tick runs after, and
+                    # the clock must then read exactly one more, not stand still before it or run past it.
                     sync()
-                    ticks = int(line.split()[1])
-                    until = game_time(server) + ticks
-                    server.console(f'tick step {ticks}')
                     deadline = time.time() + 60
-                    while game_time(server) < until:
-                        if time.time() > deadline:
-                            raise AssertionError(f'{label}: /tick step {ticks} did not run in 60 s')
+                    failure = f'{label}: /tick step 1 from game time {clock[0]} did not finish in 60 s'
+                    if (now := game_time(server, left(deadline, failure))) != clock[0]:
+                        raise AssertionError(f'{label}: the frozen clock moved from {clock[0]} to {now}')
+                    server.console('tick step 1')
+                    while (now := game_time(server, left(deadline, failure))) == clock[0]:
                         time.sleep(0.02)
+                    if now != clock[0] + 1:
+                        raise AssertionError(f'{label}: /tick step 1 moved the clock from {clock[0]} to {now}')
+                    clock[0] = now
                     sync()
                 else:
                     client.stdin.write(line + '\n')
@@ -286,16 +301,42 @@ def run_side(label, server_command, client_command, build, world):
     return out.read_text(encoding='utf-8').splitlines()
 
 
+def row(tick, texts):
+    """One stepped tick's reads (FREQUENCY, PHASE, COOLDOWN) as `tNN frequency F phase`, or as they came."""
+    found = re.search(r'block data: (-?\d+)$', texts[0]) if len(texts) == 3 else None
+    tests = [text.removeprefix('chat ') for text in texts[1:]]
+    if not found or any(test not in ('Test passed', 'Test failed') for test in tests):
+        return f'{tick} ' + ' | '.join(texts)
+    phase = 'active' if tests[0] == 'Test passed' else 'cooldown' if tests[1] == 'Test passed' else 'inactive'
+    return f'{tick} frequency {found.group(1)} {phase}'
+
+
 def compared(lines):
-    cases = {}
+    cases, ticks = {}, {}
     for line in lines:
         _, step, text = line.split(' ', 2)
-        step = step.removeprefix('step=')
+        case, _, tick = step.removeprefix('step=').partition('#')
         # `[Server: ...]` is the server echoing the console's `tick` commands to an operator: not under test.
-        if step in CASES and text.startswith(('chat ', 'teleport ', 'error', 'disconnected')) \
+        if case in CASES and text.startswith(('chat ', 'teleport ', 'error', 'disconnected')) \
                 and not text.startswith('chat [Server: '):
-            cases.setdefault(step, []).append(text)
+            if tick:
+                ticks.setdefault(case, {}).setdefault(tick, []).append(text)
+            else:
+                cases.setdefault(case, []).append(text)
+    for case, rows in ticks.items():
+        cases.setdefault(case, []).extend(row(tick, texts) for tick, texts in rows.items())
     return cases
+
+
+def changes(rows):
+    """A stepped case's rows where something changed: its whole sequence in a few entries."""
+    return [r for i, r in enumerate(rows) if i == 0 or r.split(' ', 1)[-1] != rows[i - 1].split(' ', 1)[-1]]
+
+
+def first_difference(want, got):
+    """The first differing row of two stepped sequences and the rows beside it, on each side."""
+    i = next((i for i, (a, b) in enumerate(zip(want, got)) if a != b), min(len(want), len(got)))
+    return f'first difference at row {i}: vanilla {want[max(0, i - 1):i + 2]} horizon {got[max(0, i - 1):i + 2]}'
 
 
 def main():
@@ -327,12 +368,15 @@ def main():
     differ, fixed = [], []
     for case in CASES:
         want, got = vanilla.get(case, []), horizon.get(case, [])
-        print(f'{"same  " if want == got else "DIFFER"} {case}: vanilla {want}' + ('' if want == got else f' horizon {got}'))
+        shown, other = (changes(want), changes(got)) if case in STEPPED else (want, got)
+        print(f'{"same  " if want == got else "DIFFER"} {case}: vanilla {shown}' + ('' if want == got else f' horizon {other}'))
         if not want or any(line.startswith(('error', 'disconnected')) for line in want):
             raise AssertionError(f'{case}: vanilla recorded nothing or failed: {want}')
         if want == got:
             if case in KNOWN:
                 fixed.append(case)
+        elif case in STEPPED and case not in KNOWN:
+            differ.append(f'{case}: {first_difference(want, got)}')
         elif case not in KNOWN:
             differ.append(f'{case}:\n' + '\n'.join(difflib.unified_diff(want, got, 'vanilla', 'horizon', n=1, lineterm='')))
     if fixed:

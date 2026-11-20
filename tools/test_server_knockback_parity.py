@@ -257,6 +257,40 @@ def server_data(server, selector, path, timeout=120):
     raise AssertionError(f'{server.log_path.name}: no entity data in {timeout} s')
 
 
+TICK_STATUS = re.compile(r'The game is (frozen|running)')
+
+
+def left(deadline, what):
+    """The seconds left before `deadline`, or the failure `what` once there are none."""
+    remaining = deadline - time.time()
+    if remaining <= 0:
+        raise AssertionError(what)
+    return remaining
+
+
+def frozen(server, timeout=60):
+    """Waits until the server reports ticking frozen (`/tick query`) and its game clock stands still across four
+    ticks' time, and returns that clock. Two equal clock reads alone can fall inside one live tick."""
+    deadline = time.time() + timeout
+    failure = f'{server.log_path.name}: ticking was not reported frozen with a still clock in {timeout} s'
+    while True:
+        start = len(server.lines)
+        server.console('tick query')
+        status = None
+        while status is None:
+            status = next((m.group(1) for line in server.lines[start:] if (m := TICK_STATUS.search(line))), None)
+            if status is None:
+                left(deadline, failure)
+                time.sleep(0.02)
+        if status == 'frozen':
+            clock = game_time(server, left(deadline, failure))
+            time.sleep(0.2)
+            if game_time(server, left(deadline, failure)) == clock:
+                return clock
+        left(deadline, failure)
+        time.sleep(0.05)
+
+
 def server_dir(directory, world):
     if directory.exists():
         shutil.rmtree(directory)
@@ -307,10 +341,8 @@ def run_side(label, server_command, client_command, build, world):
                     wait_ticks(server, int(line.split()[1]))
                     sync()
                 elif word == 'frozen':
-                    # The tick in flight when ticking was frozen has finished: the clock reads the same twice.
                     sync()
-                    while game_time(server) != game_time(server):
-                        pass
+                    frozen(server)
                 elif word == 'hit':
                     # Alice hits the mob. A frozen server still ticks its players, and the hit lands in Alice's
                     # next tick, not when the packet arrives: the mob's motion says when it has.
@@ -328,15 +360,20 @@ def run_side(label, server_command, client_command, build, world):
                     # next tick, not when the packet arrives.
                     sync()
                     x, y, z, selector = line.split()[1:5]
-                    before = server_data(server, selector, 'Motion')
-                    client.stdin.write(f'useblock Alice {x} {y} {z}\n')
-                    client.stdin.flush()
                     deadline = time.time() + 30
-                    while server_data(server, selector, 'Motion') == before:
-                        if time.time() > deadline:
-                            raise AssertionError(f'{server.log_path.name}: the click on {x} {y} {z} did not move '
-                                                 f'{selector} in 30 s')
-                        time.sleep(0.05)
+                    failure = f'{server.log_path.name}: the click on {x} {y} {z} did not move {selector} in 30 s'
+                    try:
+                        before = server_data(server, selector, 'Motion', timeout=left(deadline, failure))
+                        client.stdin.write(f'useblock Alice {x} {y} {z}\n')
+                        client.stdin.flush()
+                        while True:
+                            motion = server_data(server, selector, 'Motion', timeout=left(deadline, failure))
+                            left(deadline, failure)  # a reply after the deadline is no success
+                            if motion != before:
+                                break
+                            time.sleep(0.05)
+                    except AssertionError as error:
+                        raise AssertionError(f'{failure} ({error})') from None
                     sync()
                 elif word == 'waitage':
                     # Hold until an entity's `Age` has reached N. A value that
