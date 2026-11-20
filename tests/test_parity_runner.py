@@ -664,6 +664,39 @@ class OracleReuseTests(unittest.TestCase):
         self.oracle(PARITY_SHIM_RUN="two")
         self.assertNotEqual(self.last()["call"], first)
 
+    def test_a_call_in_an_oracle_folder_replays_while_the_harness_writes_around_it(self):
+        """A harness's run of a folder oracle (tools/test_food_parity.py's shape): its inputs written, the call's log
+        truncated before it, then the Rust side's output and the report beside them. Handed the work folder itself,
+        the call never replays; handed a folder of its own (tools/oracle_folders.py), it does from the second run."""
+        from tools import oracle_folders
+        fake = self.bin / "java"
+        fake.write_text(f"#!{sys.executable}\nimport sys, pathlib\n"
+                        "if sys.argv[1:] == ['-version']: sys.exit(print('fake java 1', file=sys.stderr))\n"
+                        "folder = pathlib.Path(sys.argv[1])\n"
+                        "(folder / 'server.txt').write_text((folder / 'inputs.txt').read_text())\n"
+                        "print('done')\n")
+        fake.chmod(0o755)
+
+        def harness(build, folder_for):
+            build.mkdir(exist_ok=True)
+            inputs = build / "inputs.txt"
+            inputs.write_text("cases")
+            folder = folder_for(build, inputs)
+            with (build / "server-server.log").open("w") as log:
+                self.subprocess.run(["java", str(folder)], env=self.env, stdout=log, stdin=self.subprocess.DEVNULL,
+                                    check=True)
+            self.assertEqual((folder / "server.txt").read_text(), "cases")
+            (build / "rust.txt").write_text("rust")
+            (build / "report.json").write_text("{}")
+            return self.reasons()
+
+        root = Path(self.temp.name)
+        shared = [harness(root / "shared", lambda build, inputs: build) for _ in range(3)]
+        self.assertEqual(shared, [["no-record"], ["input-set"], ["output-stamp"]])
+        own = [harness(root / "own", lambda build, inputs: oracle_folders.folder(build / "oracle-server", inputs))
+               for _ in range(3)]
+        self.assertEqual(own, [["no-record"], ["hit"], ["hit"]])
+
     def test_a_java_killed_by_a_signal_gives_the_same_status_keyed_or_not(self):
         # 256 - 9, as the shim's run of a recorded call has always given; the new passthroughs keep it.
         self.input.write_text("kill")
