@@ -2,11 +2,16 @@
 //! the players sent those chunks, and, wrapped with the level, to the players whose client views
 //! it (`viewed_levels`).
 use super::{Guest, Hub};
-use crate::{chunk::Chunk, lan::viewed_levels::send::Runs, world::World};
+use crate::{
+    chunk::Chunk,
+    lan::{terrain_view, viewed_levels::send::Runs},
+    world::World,
+};
 use horizon_protocol::{
     packets::play::{self, Clientbound as C},
     viewed_levels::Level,
 };
+use std::borrow::Cow;
 
 impl Hub {
     /// The players sent chunk `key` of the level in place: those in it (None), and those whose
@@ -91,6 +96,8 @@ impl Hub {
     }
 
     pub(in crate::lan) fn broadcast_block_changes(&mut self, world: &mut World) {
+        self.prepare_terrain_pass();
+        let has_views = self.has_terrain_views();
         // Chunks changed in bulk (`World::edit_runs`) go whole to those who see them: one packet each, where a
         // change of each block would be thousands (the client lights and meshes them once, on its workers).
         let bulk: Vec<(i32, i32)> = if world.bulk_log.is_empty() {
@@ -104,7 +111,8 @@ impl Hub {
             // The single-player window's far terrain draws a column it isn't sent as the window last saw it: it is
             // handed the column to summarize again (`handoff::changed`).
             let unsent = |g: &Guest, key: &(i32, i32)| {
-                self.here(g)
+                !self.terrain_protected(g.conn, &g.dimension)
+                    && self.here(g)
                     && g.address == crate::lan::conn::MEMORY_ADDRESS
                     && !g.sent_chunks.contains(key)
             };
@@ -130,8 +138,11 @@ impl Hub {
                 if holders.is_empty() {
                     continue;
                 }
-                let body = self.encoder.body_in(chunk, world);
-                self.send_to_holders(&holders, &body);
+                let ordinary = self.ordinary_terrain_holders(&holders, has_views);
+                if !ordinary.is_empty() {
+                    let body = self.encoder.body_in(chunk, world);
+                    self.send_to_holders(&ordinary, &body);
+                }
                 if recording {
                     // The prediction's replay excuses a client near the column: any of its blocks may have
                     // changed, so the one nearest the player stands for them.
@@ -158,7 +169,16 @@ impl Hub {
                 }
             }
         }
+        let mut refresh: crate::fast_hash::FxHashSet<_> = if has_views {
+            bulk.iter()
+                .copied()
+                .flat_map(|key| std::iter::once(key).chain(terrain_view::adjacent(key)))
+                .collect()
+        } else {
+            Default::default()
+        };
         let Some(log) = world.block_log.as_mut() else {
+            self.finish_terrain_refresh(&refresh);
             return;
         };
         if !bulk.is_empty() {
@@ -172,6 +192,7 @@ impl Hub {
             });
         }
         if log.is_empty() {
+            self.finish_terrain_refresh(&refresh);
             return;
         }
         let mut changes = std::mem::take(log);
@@ -179,6 +200,26 @@ impl Hub {
         changes.dedup();
         // The prediction's replay excuses a client that hadn't seen a change near it.
         let recording = self.recording();
+        // Each changed block can change the exposure of its six neighbours, including across a
+        // chunk border. The ordinary view receives only the original log.
+        let mut extra = std::collections::BTreeMap::<_, Vec<_>>::new();
+        if let Some(views) = self.terrain.as_ref().filter(|_| has_views) {
+            for &p in &changes {
+                for face in terrain_view::FACES {
+                    let pos @ (x, y, z) = terrain_view::offset(p, face);
+                    let column = terrain_view::column(pos);
+                    if let Some(chunk) = world.chunks.get(&column) {
+                        if terrain_view::known(chunk, x, y, z)
+                            .is_some_and(|s| views.targets_state(y, s))
+                        {
+                            extra.entry((x >> 4, y >> 4, z >> 4)).or_default().push(pos);
+                        }
+                    } else if column != terrain_view::column(p) {
+                        refresh.insert(column);
+                    }
+                }
+            }
+        }
         // Group by section.
         let mut sections: std::collections::BTreeMap<(i32, i32, i32), Vec<(i32, i32, i32)>> =
             Default::default();
@@ -188,6 +229,10 @@ impl Hub {
                 .or_default()
                 .push(p);
         }
+        let protected_sections = extra.keys().copied().collect::<Vec<_>>();
+        for key in protected_sections {
+            sections.entry(key).or_default();
+        }
         for ((sx, sy, sz), positions) in sections {
             if let Some(far) = self.far.as_mut() {
                 far.changed(sx, sz);
@@ -196,28 +241,41 @@ impl Hub {
             if holders.is_empty() {
                 continue;
             }
-            let packet = if positions.len() == 1 {
-                let (x, y, z) = positions[0];
-                C::BlockUpdate(play::BlockUpdate {
-                    pos: [x, y, z],
-                    state: world.block(x, y, z).0 as i32,
-                })
-            } else {
-                C::SectionBlocksUpdate(play::SectionBlocksUpdate {
-                    section: [sx, sy, sz],
-                    changes: positions
-                        .iter()
-                        .map(|&(x, y, z)| {
-                            let state = i64::from(world.block(x, y, z).0);
-                            state << 12
-                                | i64::from(x & 15) << 8
-                                | i64::from(z & 15) << 4
-                                | i64::from(y & 15)
-                        })
-                        .collect(),
-                })
-            };
-            self.send_to_holders(&holders, &packet.encode());
+            let section = [sx, sy, sz];
+            let state_at = |(x, y, z)| world.block(x, y, z).0;
+            let ordinary = self.ordinary_terrain_holders(&holders, has_views);
+            if !ordinary.is_empty() && !positions.is_empty() {
+                let packet = block_packet(section, &positions, state_at);
+                self.send_to_holders(&ordinary, &packet.encode());
+            }
+            let mut candidates = extra.remove(&(sx, sy, sz)).unwrap_or_default();
+            if has_views {
+                candidates.extend(positions.iter().copied());
+                candidates.sort_unstable();
+                candidates.dedup();
+                let mut encoded = crate::fast_hash::FxHashMap::default();
+                for &(i, level) in &holders {
+                    let conn = self.guests[i].conn;
+                    let Some((view, rules)) = self
+                        .terrain
+                        .as_ref()
+                        .unwrap()
+                        .view(conn, &self.config.dimension)
+                    else {
+                        continue;
+                    };
+                    let personal = (!view.reveals.is_empty()).then_some(conn);
+                    let body = encoded
+                        .entry((rules.generation, personal))
+                        .or_insert_with(|| {
+                            block_packet(section, &candidates, |p| {
+                                view.state(world, rules, p, state_at(p))
+                            })
+                            .encode()
+                        });
+                    self.send_to_holders(&[(i, level)], body);
+                }
+            }
             if recording {
                 let bounds = crate::lan::prediction::bounds(&positions);
                 for i in in_level(&holders) {
@@ -227,12 +285,32 @@ impl Hub {
                 }
             }
             // Block entities with data the client shows.
-            for &(x, y, z) in &positions {
+            let metadata_positions = if has_views { &candidates } else { &positions };
+            for &pos @ (x, y, z) in metadata_positions {
                 let state = world.block(x, y, z).0;
                 if !self
                     .encoder
-                    .entity_matches(state, world.block_entities.get(&(x, y, z)))
+                    .entity_matches(state, world.block_entities.get(&pos))
                 {
+                    continue;
+                }
+                let entitled = if has_views {
+                    Cow::Owned(
+                        holders
+                            .iter()
+                            .copied()
+                            .filter(|&(i, _)| {
+                                let conn = self.guests[i].conn;
+                                (positions.binary_search(&pos).is_ok()
+                                    || self.terrain_protected(conn, &self.config.dimension))
+                                    && self.terrain_state(conn, world, pos, state) == state
+                            })
+                            .collect(),
+                    )
+                } else {
+                    Cow::Borrowed(holders.as_slice())
+                };
+                if entitled.is_empty() {
                     continue;
                 }
                 // A decorated pot is no block entity: its tag is the chunk's saved one.
@@ -256,9 +334,29 @@ impl Hub {
                     tag,
                 })
                 .encode();
-                self.send_to_holders(&holders, &body);
+                self.send_to_holders(&entitled, &body);
             }
         }
+        self.finish_terrain_refresh(&refresh);
+    }
+
+    fn ordinary_terrain_holders<'a>(
+        &self,
+        holders: &'a [(usize, Option<Level>)],
+        has_views: bool,
+    ) -> Cow<'a, [(usize, Option<Level>)]> {
+        if !has_views {
+            return Cow::Borrowed(holders);
+        }
+        Cow::Owned(
+            holders
+                .iter()
+                .copied()
+                .filter(|&(i, _)| {
+                    !self.terrain_protected(self.guests[i].conn, &self.config.dimension)
+                })
+                .collect(),
+        )
     }
 
     /// [`Self::chunk_holders`] without the chunks they were sent.
@@ -271,6 +369,32 @@ impl Hub {
 }
 
 /// The holders in the level in place: the prediction's replay is of them only.
+fn block_packet(
+    section: [i32; 3],
+    positions: &[terrain_view::Pos],
+    state: impl Fn(terrain_view::Pos) -> u32,
+) -> C {
+    if let [p @ (x, y, z)] = *positions {
+        C::BlockUpdate(play::BlockUpdate {
+            pos: [x, y, z],
+            state: state(p) as i32,
+        })
+    } else {
+        C::SectionBlocksUpdate(play::SectionBlocksUpdate {
+            section,
+            changes: positions
+                .iter()
+                .map(|&p @ (x, y, z)| {
+                    i64::from(state(p)) << 12
+                        | i64::from(x & 15) << 8
+                        | i64::from(z & 15) << 4
+                        | i64::from(y & 15)
+                })
+                .collect(),
+        })
+    }
+}
+
 fn in_level(holders: &[(usize, Option<Level>)]) -> impl Iterator<Item = usize> + '_ {
     holders
         .iter()

@@ -43,6 +43,27 @@ pub trait PlayersServerHost {
     #[access(WorldOnly)]
     fn server_set_max_players(&mut self, max_players: u32) -> Result<(), PlayerLimitRefusal>;
     /// Side: server.
+    /// Define or replace a view owned by the calling mod. Its ID is local to that mod.
+    /// An identical definition does nothing. Replacing rules refreshes every selection of that ID.
+    #[access(WorldOnly)]
+    fn server_define_terrain_view(
+        &mut self,
+        id: u32,
+        rules: &TerrainView,
+    ) -> Result<(), TerrainViewError>;
+    /// Side: server.
+    /// Select the calling mod's view for this connected player and dimension, or release its
+    /// selection with `None`. The first mod to select owns the slot until it releases it.
+    /// The UUID can come from `player_login`, before a player has a world handle. A changed
+    /// selection requeues terrain already sent in that dimension. Rules apply to both native and Wasm mods.
+    #[access(WorldOnly)]
+    fn player_set_terrain_view(
+        &mut self,
+        player: u128,
+        dimension: &str,
+        view: Option<u32>,
+    ) -> Result<(), TerrainViewError>;
+    /// Side: server.
     /// The profile of the player with this UUID, as the server knows it,
     /// never asked of Mojang: an online player's whole profile (the properties
     /// the player list gives, so with those `player_set_profile_property` set),
@@ -525,8 +546,11 @@ pub trait PlayersBackend {
     /// may call it. On a client, for the local player only. None for an unknown state, a
     /// stale or unavailable player.
     #[access(WorldOnly)]
-    fn player_has_correct_tool_for_drops(&self, player: PlayerRef, state: BlockState)
-    -> Option<bool>;
+    fn player_has_correct_tool_for_drops(
+        &self,
+        player: PlayerRef,
+        state: BlockState,
+    ) -> Option<bool>;
 }
 /// The handles' client reads of the `players` area, implemented by the game and reached through [`Backend`].
 // hidden: a handle's backend, reached through `Backend`; mods call the handle, never this trait

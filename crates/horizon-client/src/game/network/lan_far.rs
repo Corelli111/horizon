@@ -49,7 +49,12 @@ impl Game<'_> {
         }
         let dim = Dim::from_id(&guest.dimension);
         let position = guest.position;
-        let source = self.lod_source_in(dim);
+        let protected = host.hub.terrain_protected(conn, &guest.dimension);
+        let source = if protected {
+            None
+        } else {
+            self.lod_source_in(dim)
+        };
         let Some(host) = self.lan.as_mut() else {
             return;
         };
@@ -88,6 +93,7 @@ impl Game<'_> {
         let guests = &host.hub.guests;
         far.deliver(|conn, data| match guests.iter().find(|g| g.conn == conn) {
             None => Delivery::Gone,
+            Some(g) if host.hub.terrain_protected(conn, &g.dimension) => Delivery::Gone,
             Some(g) if g.sender.pending.load(Ordering::Relaxed) > BACKLOG => Delivery::Busy,
             Some(g) => {
                 send(&g.sender, std::mem::take(data));

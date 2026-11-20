@@ -51,6 +51,7 @@ pub(crate) mod startup_progress;
 pub(crate) mod structure_template;
 pub(crate) mod structure_type;
 pub(crate) mod tags;
+pub(crate) mod terrain_view;
 pub(crate) mod ticket_controller;
 pub(crate) mod types;
 pub(crate) mod world_fluid;

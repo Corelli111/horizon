@@ -2661,6 +2661,10 @@ impl Game<'_> {
             return;
         }
         let dimension = self.dim.id();
+        if let Some(host) = self.lan.as_mut() {
+            host.hub
+                .terrain_residency_changed(loaded.iter().map(|&(x, z, _)| (x, z)));
+        }
         for (x, z, new) in loaded {
             self.native_chunk_load(dimension, [x, z], new);
         }
@@ -2674,6 +2678,10 @@ impl Game<'_> {
             return;
         }
         let dimension = self.dim.id();
+        if let Some(host) = self.lan.as_mut() {
+            host.hub
+                .terrain_residency_changed(unloaded.iter().map(|chunk| (chunk.x, chunk.z)));
+        }
         for chunk in unloaded {
             self.native_chunk_and_block_entities_unload(dimension, [chunk.x, chunk.z]);
         }
