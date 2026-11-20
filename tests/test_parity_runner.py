@@ -735,6 +735,8 @@ class OracleReuseTests(unittest.TestCase):
     def test_jvm_options_from_the_environment_give_another_folder(self):
         # They can change what an oracle writes (VanillaCollisionOracle's horizon.prepare.reuse), and the shim runs such
         # a call each time: it must not find the outputs of a call without them.
+        from tools import oracle_folders
+        self.assertEqual(oracle_folders.UNKEYED, UNKEYED_VARIABLES)
         build = Path(self.temp.name) / "build"
         build.mkdir()
         (build / "inputs.txt").write_text("cases")

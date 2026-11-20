@@ -22,10 +22,9 @@ from pathlib import Path
 import re
 import shutil
 
-try:
-    from .parity_shim import UNKEYED
-except ImportError:
-    from parity_shim import UNKEYED
+# The variables the JVM and javac read options from (tools/parity_shim.py's UNKEYED, which a test keeps equal): not
+# imported, so that a change to the shim doesn't count as a change to every harness using this module.
+UNKEYED = ("JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS", "JDK_JAVAC_OPTIONS", "CLASSPATH")
 
 
 def folder(path, *inputs, call=()):
