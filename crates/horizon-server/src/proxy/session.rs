@@ -62,11 +62,15 @@ struct State {
     phase: Phase,
     /// StartConfiguration is sent and the client has not answered yet.
     pending_ack: bool,
+    /// FinishConfiguration was sent and the proxy is still awaiting the client's transition to play.
+    finish_sent: bool,
     game: Option<Arc<Mutex<ConnWriter>>>,
     /// Shuts the game's socket the same way.
     game_closer: Option<Closer>,
     /// Which game's packets are passed on: bumped each time a game goes or comes.
     generation: u64,
+    /// Which engine process owns the installed backend connection.
+    engine_generation: Option<u64>,
     replay: Replay,
     /// A game just logged into again: tell it the chat session when it starts play.
     replay_play: bool,
@@ -96,10 +100,12 @@ pub(super) fn run(
     };
     // A game that is up is logged into first, so that its refusal (a ban, a full server) is what the player
     // sees, as without the proxy. A game that is down (or going down) holds the player at once.
-    let game = if inner.is_up() {
+    let game = if let Some(engine) = inner.up_generation() {
         match backend::login(inner.game, &inner.secret, &identity) {
-            Ok(game) => Some(game),
-            Err(backend::Failure::Refused(json)) => return refuse(&mut client, json),
+            Ok(game) => Some((engine, game)),
+            Err(backend::Failure::Refused(json)) if inner.up_generation() == Some(engine) => {
+                return refuse(&mut client, json);
+            }
             Err(e) => {
                 inner.note(
                     "DEBUG",
@@ -129,16 +135,18 @@ pub(super) fn run(
         client_closer,
         client: Mutex::new(client_writer),
         state: Mutex::new(State {
-            held: game.is_none(),
+            held: true,
             phase: Phase::Config,
             pending_ack: false,
+            finish_sent: false,
             game: None,
             game_closer: None,
             generation: 0,
+            engine_generation: None,
             replay: Replay::default(),
             replay_play: false,
-            held_since: game.is_none().then(Instant::now),
-            attaching: false,
+            held_since: Some(Instant::now()),
+            attaching: game.is_some(),
             keep_alive: None,
             last_keep_alive: Instant::now(),
             ended: false,
@@ -150,30 +158,23 @@ pub(super) fn run(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(session.clone());
-    match game {
-        Some(Backend { reader, mut writer }) => {
-            if backend::acknowledge(&mut writer).is_err() {
-                return session.end();
-            }
-            session.attach_game(reader, writer);
-            inner.note(
-                "INFO",
-                &format!(
-                    "{} joined through the proxy (UUID {:032x})",
-                    who.name, who.uuid
-                ),
-            );
-        }
-        None => {
-            inner.note(
-                "INFO",
-                &format!("{} joined while the game is down: held", who.name),
-            );
-            // The game may have come up between the check and the registration.
-            if inner.is_up() {
-                session.resume();
-            }
-        }
+    let attached = game.is_some_and(|(engine, game)| session.attach_game(game, engine, 0, false));
+    session.lock().attaching = false;
+    if attached {
+        inner.note(
+            "INFO",
+            &format!(
+                "{} joined through the proxy (UUID {:032x})",
+                who.name, who.uuid
+            ),
+        );
+    } else {
+        inner.note(
+            "INFO",
+            &format!("Holding {} until the game accepts them", who.name),
+        );
+        // Readiness can change between the initial login and registration.
+        session.resume();
     }
     session.read_client(client_reader);
     session.end();
@@ -231,12 +232,24 @@ impl Session {
     pub fn end(&self) {
         let game = {
             let mut st = self.lock();
-            if st.ended {
+            let Some(game) = Self::mark_ended(&mut st) else {
                 return;
-            }
-            st.ended = true;
-            st.game_closer.take()
+            };
+            game
         };
+        self.close_ended(game);
+    }
+
+    fn mark_ended(st: &mut State) -> Option<Option<Closer>> {
+        if st.ended {
+            return None;
+        }
+        st.ended = true;
+        st.game = None;
+        Some(st.game_closer.take())
+    }
+
+    fn close_ended(&self, game: Option<Closer>) {
         self.client_closer.close();
         if let Some(game) = game {
             game.close();
@@ -250,29 +263,62 @@ impl Session {
             .retain(|s| !std::ptr::eq(Arc::as_ptr(s), me));
     }
 
-    /// The game is logged into and acknowledged: its packets go to the client from now on, and the client's
-    /// to it.
-    fn attach_game(self: &Arc<Self>, reader: ConnReader, writer: ConnWriter) {
+    /// Installs the backend only while its engine and this hold are still current.
+    fn attach_game(self: &Arc<Self>, game: Backend, engine: u64, hold: u64, replay: bool) -> bool {
+        let Backend { reader, writer } = game;
         let Ok(closer) = reader.closer() else {
-            return self.end();
+            return false;
         };
         let writer = Arc::new(Mutex::new(writer));
-        let generation = {
+        let mut output = writer.lock().unwrap_or_else(|e| e.into_inner());
+        let (generation, packets) = {
+            let gate = self.inner.gate();
             let mut st = self.lock();
+            if gate.phase != super::Gate::Up
+                || gate.generation != engine
+                || st.ended
+                || !st.held
+                || st.generation != hold
+                || st.phase != Phase::Config
+                || st.pending_ack
+                || st.finish_sent
+                || st
+                    .held_since
+                    .is_none_or(|since| since.elapsed() >= self.inner.hold)
+            {
+                return false;
+            }
+            let packets = if replay {
+                st.replay.config_packets()
+            } else {
+                Vec::new()
+            };
             st.generation += 1;
+            st.engine_generation = Some(engine);
             st.game = Some(writer.clone());
             st.game_closer = Some(closer);
             st.held = false;
             st.held_since = None;
-            st.generation
+            st.replay_play = replay;
+            (st.generation, packets)
         };
+        // The writer is locked before publication. Live packets arriving during replay follow it.
+        let sent = backend::acknowledge(&mut output)
+            .and_then(|()| packets.iter().try_for_each(|packet| output.send(packet)));
+        drop(output);
+        if sent.is_err() {
+            self.game_lost(generation);
+            return false;
+        }
         let session = self.clone();
         let spawned = thread::Builder::new()
             .name("Proxy game reader".into())
             .spawn(move || session.read_game(generation, reader, &writer));
         if spawned.is_err() {
             self.end();
+            return false;
         }
+        true
     }
 
     /// The game's packets to the client, until this game goes.
@@ -292,8 +338,17 @@ impl Session {
             let mut client = self.client();
             let (phase, replay_play) = {
                 let mut st = self.lock();
-                if st.generation != generation || st.held {
+                if st.generation != generation || st.held || st.ended {
                     return;
+                }
+                if st.phase == Phase::Config
+                    && id == ids::configuration::clientbound::FINISH_CONFIGURATION
+                {
+                    st.finish_sent = true;
+                } else if st.phase == Phase::Play
+                    && id == ids::play::clientbound::START_CONFIGURATION
+                {
+                    st.pending_ack = true;
                 }
                 let replay_play = st.replay_play
                     && st.phase == Phase::Play
@@ -312,6 +367,9 @@ impl Session {
                 return self.end();
             }
             drop(client);
+            if is_disconnect(phase, id) {
+                return self.end();
+            }
             if replay_play {
                 // The new game has no chat session for the player yet: the one the client made.
                 let packets = self.lock().replay.play_packets();
@@ -325,21 +383,28 @@ impl Session {
 
     /// The game this session was logged into is gone: unless this is a stop for good, hold the player.
     fn game_lost(self: &Arc<Self>, generation: u64) {
-        if self.lock().generation != generation {
-            return;
-        }
         if self.inner.closing() {
-            return self.end();
+            let current = {
+                let st = self.lock();
+                !st.ended && st.generation == generation
+            };
+            if current {
+                self.end();
+            }
+        } else {
+            self.hold_if(|st| st.generation == generation);
         }
-        // Everyone is going the same way: the gate says so, and holds all.
-        self.inner.stopping();
     }
 
     /// The client's packets: noted for a later replay, then to the game, or swallowed while held.
     fn read_client(self: &Arc<Self>, mut reader: ConnReader) {
         while let Ok((id, payload)) = reader.recv() {
             let game = {
+                let mut client = self.client();
                 let mut st = self.lock();
+                if st.ended {
+                    return;
+                }
                 let before = st.phase;
                 st.replay.note(before, id, &payload);
                 if before == Phase::Config
@@ -351,6 +416,20 @@ impl Session {
                     // The answer to the proxy's own keep-alive: the game never sent it.
                     st.keep_alive = None;
                     continue;
+                }
+                if before == Phase::Config
+                    && id == ids::configuration::serverbound::FINISH_CONFIGURATION
+                {
+                    if !st.finish_sent {
+                        continue;
+                    }
+                    st.finish_sent = false;
+                    if st.held && Self::start_configuration(&mut st, &mut client).is_err() {
+                        drop(st);
+                        drop(client);
+                        return self.end();
+                    }
+                    self.wake.notify_all();
                 }
                 st.phase = next_phase(before, id);
                 if before == Phase::Play
@@ -376,29 +455,27 @@ impl Session {
     }
 
     /// Holds the player: the game it was relayed to is gone or going.
-    pub fn hold(self: &Arc<Self>) {
+    pub(super) fn hold_game(self: &Arc<Self>, engine: u64) {
+        self.hold_if(|st| st.engine_generation == Some(engine));
+    }
+
+    fn hold_if(self: &Arc<Self>, current: impl FnOnce(&State) -> bool) {
         let old = {
             let mut client = self.client();
             let mut st = self.lock();
-            if st.held || st.ended {
+            if st.held || st.ended || !current(&st) {
                 return;
             }
             st.held = true;
             st.held_since = Some(Instant::now());
             st.generation += 1;
+            st.engine_generation = None;
             st.replay_play = false;
             st.last_keep_alive = Instant::now();
-            if st.phase == Phase::Play {
-                st.pending_ack = true;
-                // The client takes this for "set the world up again": a loading screen, no disconnect.
-                if client
-                    .send(&body(ids::play::clientbound::START_CONFIGURATION, &[]))
-                    .is_err()
-                {
-                    drop(st);
-                    drop(client);
-                    return self.end();
-                }
+            if st.phase == Phase::Play && Self::start_configuration(&mut st, &mut client).is_err() {
+                drop(st);
+                drop(client);
+                return self.end();
             }
             st.game = None;
             st.game_closer.take()
@@ -412,47 +489,70 @@ impl Session {
         );
     }
 
+    fn start_configuration(
+        st: &mut State,
+        client: &mut ConnWriter,
+    ) -> Result<(), super::wire::Error> {
+        if !st.pending_ack {
+            client.send(&body(ids::play::clientbound::START_CONFIGURATION, &[]))?;
+            st.pending_ack = true;
+        }
+        Ok(())
+    }
+
+    fn same_hold(st: &State, hold: u64) -> bool {
+        st.held && !st.ended && st.generation == hold
+    }
+
     /// The game is back: logs into it again as this player, tells it what the client said, and lets its
     /// configuration through to the client.
     pub fn resume(self: &Arc<Self>) {
-        {
+        let Some(engine) = self.inner.up_generation() else {
+            return;
+        };
+        let hold = {
             let mut st = self.lock();
             if !st.held || st.attaching || st.ended {
                 return;
             }
             st.attaching = true;
-        }
+            st.generation
+        };
         let session = self.clone();
         let spawned = thread::Builder::new()
             .name("Proxy resume".into())
             .spawn(move || {
-                let result = session.log_in_again();
-                session.lock().attaching = false;
+                let result = session.log_in_again(engine, hold);
                 if let Err(reason) = result {
                     session.inner.note(
                         "WARN",
                         &format!("{} can't be put back in the game: {reason}", session.name),
                     );
-                    session.disconnect(&translated(
-                        "horizon.proxy.unavailable",
-                        "The server is not available right now. Try again in a moment.",
-                    ));
+                    session.disconnect_if(
+                        &translated(
+                            "horizon.proxy.unavailable",
+                            "The server is not available right now. Try again in a moment.",
+                        ),
+                        Some(engine),
+                        |st| Self::same_hold(st, hold),
+                    );
                 }
+                session.lock().attaching = false;
             });
         if spawned.is_err() {
             self.lock().attaching = false;
         }
     }
 
-    fn log_in_again(self: &Arc<Self>) -> Result<(), String> {
+    fn log_in_again(self: &Arc<Self>, engine: u64, hold: u64) -> Result<(), String> {
         // The client has to be in configuration before the game's configuration reaches it.
         let deadline = Instant::now() + ACK_WAIT;
         {
             let mut st = self.lock();
-            while st.pending_ack && !st.ended {
+            while (st.pending_ack || st.finish_sent) && Self::same_hold(&st, hold) {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
-                    return Err("the client did not answer StartConfiguration".into());
+                    return Err("the client did not enter configuration".into());
                 }
                 st = self
                     .wake
@@ -460,7 +560,7 @@ impl Session {
                     .unwrap_or_else(|e| e.into_inner())
                     .0;
             }
-            if st.ended {
+            if !Self::same_hold(&st, hold) {
                 return Ok(());
             }
         }
@@ -478,49 +578,39 @@ impl Session {
             .lock()
             .held_since
             .map_or_else(Instant::now, |since| since + self.inner.hold);
-        let (reader, mut writer) = loop {
-            let attempt = backend::login(self.inner.game, &self.inner.secret, &who).and_then(
-                |Backend { reader, mut writer }| {
-                    backend::acknowledge(&mut writer)
-                        .map(|()| (reader, writer))
-                        .map_err(|e| backend::Failure::Protocol(e.to_string()))
-                },
-            );
-            match attempt {
-                Ok(pair) => break pair,
+        let game = loop {
+            if self.inner.up_generation() != Some(engine) || !Self::same_hold(&self.lock(), hold) {
+                return Ok(());
+            }
+            match backend::login(self.inner.game, &self.inner.secret, &who) {
+                Ok(game) => break game,
                 Err(backend::Failure::Refused(json)) => {
-                    self.disconnect(&super::wire::component_from_json(&json));
+                    self.disconnect_if(
+                        &super::wire::component_from_json(&json),
+                        Some(engine),
+                        |st| Self::same_hold(st, hold),
+                    );
                     return Ok(());
                 }
                 Err(other) => {
-                    if Instant::now() + RETRY >= give_up || self.lock().ended {
+                    if Instant::now() + RETRY >= give_up {
                         return Err(other.to_string());
                     }
                     thread::sleep(RETRY);
                 }
             }
         };
-        let packets = self.lock().replay.config_packets();
-        for packet in packets {
-            writer.send(&packet).map_err(|e| e.to_string())?;
+        if self.attach_game(game, engine, hold, true) {
+            self.inner
+                .note("INFO", &format!("{} is back in the game", self.name));
         }
-        {
-            let mut st = self.lock();
-            if !st.held || st.ended {
-                writer.shutdown();
-                return Ok(());
-            }
-            st.replay_play = true;
-        }
-        self.attach_game(reader, writer);
-        self.inner
-            .note("INFO", &format!("{} is back in the game", self.name));
         Ok(())
     }
 
     /// Keeps a held client alive and gives up on one held too long. Every second.
     pub fn tick(self: &Arc<Self>, now: Instant, hold: Duration) {
         let expired = {
+            let mut client = self.client();
             let mut st = self.lock();
             if !st.held || st.ended {
                 return;
@@ -531,6 +621,7 @@ impl Session {
             if !expired
                 && st.phase == Phase::Config
                 && !st.pending_ack
+                && !st.finish_sent
                 && now.duration_since(st.last_keep_alive) >= KEEP_ALIVE
             {
                 st.last_keep_alive = now;
@@ -538,55 +629,92 @@ impl Session {
                 st.keep_alive = Some((id, now));
                 let mut w = Writer::new();
                 w.i64(id);
-                let packet = body(ids::configuration::clientbound::KEEP_ALIVE, &w.data);
-                drop(st);
-                if self.client().send(&packet).is_err() {
-                    self.end();
+                if client
+                    .send(&body(ids::configuration::clientbound::KEEP_ALIVE, &w.data))
+                    .is_err()
+                {
+                    drop(st);
+                    drop(client);
+                    return self.end();
                 }
-                return;
             }
-            expired
+            expired.then_some(st.generation)
         };
-        if expired {
-            self.inner.note(
-                "WARN",
-                &format!(
-                    "The game did not come back for {}: disconnecting",
-                    self.name
-                ),
-            );
-            self.disconnect(&translated(
+        if let Some(generation) = expired {
+            let reason = translated(
                 "horizon.proxy.restart_timed_out",
                 "The server did not come back in time",
-            ));
+            );
+            if self.disconnect_if(&reason, None, |st| Self::same_hold(st, generation)) {
+                self.inner.note(
+                    "WARN",
+                    &format!("The game did not come back for {}", self.name),
+                );
+            }
+        } else {
+            // Also retries if a resume thread could not be started on the previous tick.
+            self.resume();
         }
     }
 
     /// Sends the client away with `reason`, in the state it is in, and ends the session.
     pub fn disconnect(&self, reason: &super::wire::Tag) {
-        let phase = self.lock().phase;
+        self.disconnect_if(reason, None, |_| true);
+    }
+
+    fn disconnect_if(
+        &self,
+        reason: &super::wire::Tag,
+        engine: Option<u64>,
+        allowed: impl FnOnce(&State) -> bool,
+    ) -> bool {
+        let mut client = self.client();
+        let (phase, game) = {
+            let gate = self.inner.gate();
+            if engine.is_some_and(|epoch| gate.phase != super::Gate::Up || gate.generation != epoch)
+            {
+                return false;
+            }
+            let mut st = self.lock();
+            if !allowed(&st) {
+                return false;
+            }
+            let Some(game) = Self::mark_ended(&mut st) else {
+                return false;
+            };
+            (st.phase, game)
+        };
         let id = match phase {
             Phase::Config => ids::configuration::clientbound::DISCONNECT,
             Phase::Play => ids::play::clientbound::DISCONNECT,
         };
         let mut w = Writer::new();
         w.nbt(reason);
-        let _ = self.client().send(&body(id, &w.data));
-        self.end();
+        let _ = client.send(&body(id, &w.data));
+        drop(client);
+        self.close_ended(game);
+        true
     }
 }
 
 /// Whether a packet from the game is the kick a stopping game sends everyone (`server_shutdown`), in the
 /// disconnect packet of the state the client is in.
 fn is_shutdown_kick(phase: Phase, id: i32, payload: &[u8]) -> bool {
-    let disconnect = match phase {
+    if !is_disconnect(phase, id) {
+        return false;
+    }
+    let Ok(tag) = super::wire::Reader::new(payload).nbt() else {
+        return false;
+    };
+    matches!(tag.get("translate"), Some(super::wire::Tag::String(key))
+        if *key == super::wire::JavaString::from(SHUTDOWN_KEY))
+}
+
+fn is_disconnect(phase: Phase, id: i32) -> bool {
+    id == match phase {
         Phase::Config => ids::configuration::clientbound::DISCONNECT,
         Phase::Play => ids::play::clientbound::DISCONNECT,
-    };
-    id == disconnect
-        && payload
-            .windows(SHUTDOWN_KEY.len())
-            .any(|w| w == SHUTDOWN_KEY.as_bytes())
+    }
 }
 
 const SHUTDOWN_KEY: &str = "multiplayer.disconnect.server_shutdown";
@@ -649,6 +777,13 @@ mod tests {
             Phase::Play,
             ids::play::clientbound::SYSTEM_CHAT,
             &kick
+        ));
+        let mut literal = Writer::new();
+        literal.nbt(&super::super::wire::Tag::String(SHUTDOWN_KEY.into()));
+        assert!(!is_shutdown_kick(
+            Phase::Play,
+            ids::play::clientbound::DISCONNECT,
+            &literal.data
         ));
     }
 

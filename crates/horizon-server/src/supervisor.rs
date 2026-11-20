@@ -338,7 +338,9 @@ pub fn run(dir: &Path) -> Result<(), String> {
         let exit = supervise(&shared, &mut child, &console, &mut watch);
         // A game that ended for good has no one to start it again: its players are sent away. Any other end is
         // a restart or a crash: they were held, or are now.
-        shared.proxy(|p| p.game_exited(matches!(exit, Exit::Stopped)));
+        let for_good = matches!(exit, Exit::Stopped)
+            && (watch.is_none() || shared.shutdown.load(Ordering::SeqCst));
+        shared.proxy(|p| p.game_exited(for_good));
         {
             let mut state = shared.state.lock().unwrap();
             state.engine_pid = None;
@@ -396,6 +398,7 @@ pub fn run(dir: &Path) -> Result<(), String> {
             state.last_crash = Some(status.to_string());
         }
         if !config.engine.restart_on_crash {
+            shared.proxy(|p| p.game_exited(true));
             return Err(format!(
                 "the game stopped unexpectedly ({status}); engine.restart_on_crash is off"
             ));
@@ -404,6 +407,7 @@ pub fn run(dir: &Path) -> Result<(), String> {
         crashes.retain(|t| now.duration_since(*t) < CRASH_WINDOW);
         crashes.push(now);
         if crashes.len() >= MAX_CRASHES {
+            shared.proxy(|p| p.game_exited(true));
             return Err(format!(
                 "the game stopped unexpectedly {MAX_CRASHES} times in {} minutes: not restarting it. \
                  See logs/latest.log and crash-reports/",
@@ -423,6 +427,7 @@ pub fn run(dir: &Path) -> Result<(), String> {
         let until = Instant::now() + wait;
         while Instant::now() < until {
             if signals::requests() > 0 || shared.stop.load(Ordering::SeqCst) {
+                shared.proxy(|p| p.game_exited(true));
                 return Ok(());
             }
             thread::sleep(Duration::from_millis(100));
@@ -658,7 +663,7 @@ fn info_message(line: &str) -> &str {
     line.split_once("/INFO]: ").map_or("", |(_, m)| m)
 }
 
-fn pump(shared: &Arc<Shared>, from: impl Read + Send + 'static, to_stderr: bool) {
+fn pump(shared: &Arc<Shared>, pid: u32, from: impl Read + Send + 'static, to_stderr: bool) {
     let shared = shared.clone();
     let _ = thread::Builder::new()
         .name("engine-log".into())
@@ -675,7 +680,8 @@ fn pump(shared: &Arc<Shared>, from: impl Read + Send + 'static, to_stderr: bool)
                     if message.starts_with("Done (") {
                         let up = {
                             let mut state = shared.state.lock().unwrap();
-                            let starting = state.phase == Phase::Starting;
+                            let starting =
+                                state.phase == Phase::Starting && state.engine_pid == Some(pid);
                             if starting {
                                 state.phase = Phase::Running;
                             }
@@ -685,14 +691,15 @@ fn pump(shared: &Arc<Shared>, from: impl Read + Send + 'static, to_stderr: bool)
                             shared.emit("phase", serde_json::json!({ "phase": "running" }));
                             crate::management::started(&shared);
                         }
-                    } else if message.starts_with("Stopping server")
-                        || message.starts_with("Stopping in ")
+                    } else if (message.starts_with("Stopping server")
+                        || message.starts_with("Stopping in "))
+                        && shared.state.lock().unwrap().engine_pid == Some(pid)
                     {
                         // The game's own `stop` (a command in the game, not the supervisor's), or the
                         // start of the wait `[transfer]` makes before it, so a proxy hears of it then.
                         crate::management::stopping(&shared);
                         // `/restart` in the game too: its players are held before its kick comes.
-                        shared.proxy(crate::proxy::Proxy::game_stopping);
+                        shared.proxy(|proxy| proxy.game_stopping_if_current(pid));
                     }
                 }
                 shared.log_line(line);
@@ -810,11 +817,13 @@ fn supervise(
     console: &mpsc::Receiver<String>,
     watch: &mut Option<Watch>,
 ) -> Exit {
+    let pid = child.id();
+    shared.proxy(|proxy| proxy.game_starting(pid));
     if let Some(out) = child.stdout.take() {
-        pump(shared, out, false);
+        pump(shared, pid, out, false);
     }
     if let Some(err) = child.stderr.take() {
-        pump(shared, err, true);
+        pump(shared, pid, err, true);
     }
     let mut stdin = child.stdin.take();
     let mut stopping: Option<Instant> = None;

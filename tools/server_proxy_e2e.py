@@ -280,15 +280,21 @@ def swap(engine, source):
 
 
 def entity(bins, folder, path):
-    return cli(bins, folder, 'cmd', 'data', 'get', 'entity', NAME, path).stdout.strip()
+    out = cli(bins, folder, 'cmd', 'data', 'get', 'entity', NAME, path)
+    if out.returncode == 0:
+        prefix = f"{NAME} has the following entity data: "
+        return next((line[len(prefix):] for line in out.stdout.splitlines() if line.startswith(prefix)), None)
 
 
 def scenario_restart(bins, folder, server, port, engine, player):
     items, position = entity(bins, folder, 'Inventory'), entity(bins, folder, 'Pos')
-    check('diamond' in items, f'{NAME} holds the items before the restart ({items[:80]!r})')
+    diamonds = 'Inventory[{id:"minecraft:diamond"}].count'
+    check(entity(bins, folder, diamonds) == '7', f'{NAME} holds seven diamonds before the restart')
+    check(items is not None and position is not None, f'{NAME}\'s inventory and position were read')
     old_game = children(server.process.pid)
     old_inode = os.stat(engine).st_ino
     local, sock = player.local, player.sock
+    packet_boundary = len(player.packets)
     swap(engine, bins / f'horizon-client{EXE}')
     check(os.stat(engine).st_ino != old_inode, 'the engine binary was swapped (a new file at the same path)')
     out = cli(bins, folder, 'cmd', 'restart')
@@ -297,21 +303,22 @@ def scenario_restart(bins, folder, server, port, engine, player):
              'a new game process after the restart', 300)
     check(not player.closed.is_set() and player.reason is None,
           f'{NAME} was not disconnected while the game restarted ({player.reason})')
-    server.wait_for(DONE, 300)
     # Out of play for the loading screen, then back in it: the game's Login packet again.
-    wait_for(lambda: player.in_play.is_set() and player.state == 'play', f'{NAME} to be back in play', 300)
+    wait_for(lambda: ('play', PLAY_LOGIN) in player.packets[packet_boundary:] and player.in_play.is_set(),
+             f'{NAME} to be back in play', 300)
     check(player.sock is sock and player.local == local and not player.closed.is_set(),
           f'{NAME} is back on the same TCP connection ({local})')
     for state, packet_id in player.packets:
         if (state, packet_id) in (('play', PLAY_DISCONNECT), ('config', CFG_DISCONNECT), ('login', 0)):
             raise Failed(f'{NAME} was sent a disconnect ({state} packet {packet_id})')
-    check(('play', PLAY_START_CONFIG) in player.packets, f'{NAME} was told to set the world up again, not to leave')
+    check(('play', PLAY_START_CONFIG) in player.packets[packet_boundary:],
+          f'{NAME} was told to set the world up again')
     new_inode = os.stat(f'/proc/{children(server.process.pid)[0]}/exe').st_ino if os.path.exists('/proc') else None
     check(new_inode in (None, os.stat(engine).st_ino), 'the new game process runs the swapped engine file')
     check(entity(bins, folder, 'Inventory') == items, f'{NAME}\'s inventory is as it was')
     check(entity(bins, folder, 'Pos') == position, f'{NAME} is where they were')
     player.command('give @s minecraft:diamond 1')
-    wait_for(lambda: entity(bins, folder, 'Inventory') != items, f'{NAME}\'s command to run in the new game')
+    wait_for(lambda: entity(bins, folder, diamonds) == '8', f'{NAME}\'s command to run in the new game')
     check(True, f'{NAME} plays on after the restart')
 
 

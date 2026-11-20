@@ -27,6 +27,7 @@ pub struct FakeGame {
     pub seen: Arc<Mutex<Seen>>,
     streams: Arc<Mutex<Vec<TcpStream>>>,
     stopped: Arc<std::sync::atomic::AtomicBool>,
+    listener: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 /// A game that forwards-logs players in with `secret`, shows its status and echoes play packets of id
@@ -52,7 +53,7 @@ impl FakeGame {
             streams.clone(),
             stopped.clone(),
         );
-        thread::spawn(move || {
+        let listener = thread::spawn(move || {
             for stream in listener.incoming() {
                 if off.load(std::sync::atomic::Ordering::SeqCst) {
                     return;
@@ -70,6 +71,7 @@ impl FakeGame {
             seen,
             streams,
             stopped,
+            listener: Mutex::new(Some(listener)),
         }
     }
 
@@ -77,7 +79,10 @@ impl FakeGame {
     pub fn stop(&self) {
         self.stopped
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(listener) = self.listener.lock().unwrap().take() {
+            let _ = TcpStream::connect(("127.0.0.1", self.port));
+            listener.join().unwrap();
+        }
         for s in self.streams.lock().unwrap().drain(..) {
             let _ = s.shutdown(std::net::Shutdown::Both);
         }
@@ -568,8 +573,7 @@ fn restart_in_place(how: &str) {
             assert_eq!(player.next().0, ids::play::clientbound::START_CONFIGURATION);
             game.kick_and_stop();
         }
-        // A game that stopped by itself (`/stop` or `/restart` in game): no one told the proxy first, and the
-        // kick it sends everyone is what tells it.
+        // The game's shutdown notice can reach a client before the supervisor observes the exit.
         "kick" => game.kick_and_stop(),
         // A crash: the connection to the game just ends.
         _ => game.stop(),
@@ -577,6 +581,7 @@ fn restart_in_place(how: &str) {
     if how != "planned" {
         assert_eq!(player.next().0, ids::play::clientbound::START_CONFIGURATION);
     }
+    proxy.game_exited(false);
     // Held: kept alive by the proxy, and never sent the game's kick or a disconnect.
     let during = player.wait(Duration::from_millis(900));
     assert!(
@@ -632,6 +637,63 @@ fn the_games_own_shutdown_kick_is_a_hold_not_a_disconnect() {
 #[test]
 fn a_crash_holds_the_player_too() {
     restart_in_place("crash");
+}
+
+#[test]
+fn a_restart_waits_for_configuration_already_sent_to_the_client() {
+    let dir = temp_dir("finish-in-flight");
+    let secret = super::secret(&dir).unwrap();
+    let game = FakeGame::start(&secret);
+    let (proxy, port) = proxy_for(&game, &dir);
+    proxy.game_up();
+    let mut player = Player::login_only(port, "Alex");
+    while player.c.recv().unwrap().0 != ids::configuration::clientbound::FINISH_CONFIGURATION {}
+
+    proxy.game_stopping();
+    game.stop();
+    let again = FakeGame::start_on(game.port, &secret);
+    proxy.game_up();
+
+    player
+        .c
+        .send(&body(
+            ids::configuration::serverbound::FINISH_CONFIGURATION,
+            &[],
+        ))
+        .unwrap();
+    player.state = Phase::Play;
+    assert_eq!(player.next().0, ids::play::clientbound::START_CONFIGURATION);
+    player.until(ids::play::clientbound::LOGIN);
+    player.echo(b"resumed");
+    again.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_player_leaving_does_not_hold_other_players() {
+    let dir = temp_dir("leave");
+    let secret = super::secret(&dir).unwrap();
+    let game = FakeGame::start(&secret);
+    let (left, departed) = std::sync::mpsc::channel();
+    let mut config = Config::default();
+    config.server.online_mode = false;
+    config.server.bind = "127.0.0.1".into();
+    config.server.port = free_port();
+    config.proxy.game_port = game.port;
+    let proxy = start(&dir, &config, move |_, line| {
+        if line == "Alex left through the proxy" {
+            let _ = left.send(());
+        }
+    })
+    .unwrap();
+    proxy.game_up();
+    let first = Player::join(config.server.port, "Alex", &[]);
+    let mut second = Player::join(config.server.port, "Steve", &[]);
+    first.c.writer.shutdown();
+    departed.recv_timeout(Duration::from_secs(5)).unwrap();
+    second.echo(b"still playing");
+    game.stop();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
