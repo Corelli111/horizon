@@ -27,14 +27,14 @@ import time
 try:
     from . import lab, test_rust_parity as base
     from .test_dedicated_server_parity import Server, game_time, wait_ticks
-    from .test_locator_bar_parity import generate_world
-    from .test_server_knockback_parity import frozen, left, server_dir
+    from .test_locator_bar_parity import ClientOutput, generate_world
+    from .test_server_knockback_parity import SYNC_TIMEOUT, frozen, left, server_dir
 except ImportError:
     import lab
     import test_rust_parity as base
     from test_dedicated_server_parity import Server, game_time, wait_ticks
-    from test_locator_bar_parity import generate_world
-    from test_server_knockback_parity import frozen, left, server_dir
+    from test_locator_bar_parity import ClientOutput, generate_world
+    from test_server_knockback_parity import SYNC_TIMEOUT, frozen, left, server_dir
 
 NAME = 'server-wool-vibration-parity'
 KNOWN = {}
@@ -224,14 +224,12 @@ def run_side(label, server_command, client_command, build, world):
         with (build / f'{label}-client.log').open('w') as log:
             client = subprocess.Popen([*map(str, client_command), '127.0.0.1', str(port), str(out)], cwd=lab.ROOT,
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            output = ClientOutput(client, log, f'{label} (see {build}/{label}-client.log)')
 
             def sync():
                 client.stdin.write('sync Alice\n')
                 client.stdin.flush()
-                while (reply := client.stdout.readline()) != 'synced Alice\n':
-                    if not reply:
-                        raise AssertionError(f'{label}: the client exited (see {build}/{label}-client.log)')
-                    log.write(reply)
+                output.expect('synced Alice', SYNC_TIMEOUT)
 
             clock = [None]  # the frozen game clock while a walk is stepped
 
@@ -290,7 +288,9 @@ def run_side(label, server_command, client_command, build, world):
                     for line in lines:
                         send(line)
                 send('end')
-                log.write(client.communicate(timeout=120)[0])
+                client.stdin.close()
+                output.drain(120)
+                client.wait(timeout=10)
             finally:
                 if client.poll() is None:
                     client.kill()
@@ -302,16 +302,42 @@ def run_side(label, server_command, client_command, build, world):
 
 
 def row(tick, texts):
-    """One stepped tick's reads (FREQUENCY, PHASE, COOLDOWN) as `tNN frequency F phase`, or as they came."""
-    found = re.search(r'block data: (-?\d+)$', texts[0]) if len(texts) == 3 else None
+    """One stepped tick's reads (FREQUENCY, PHASE, COOLDOWN) as (`tNN frequency F phase`, None), or (the replies as
+    they came, why they are no observation): a missing or extra reply, an error or timeout, a reply that is not
+    the expected one, or both phase predicates true."""
+    raw = f'{tick} ' + ' | '.join(texts)
+    if len(texts) != 3:
+        return raw, f'{len(texts)} replies, not 3: {texts}'
+    found = re.fullmatch(r'chat .* has the following block data: (-?\d+)', texts[0])
     tests = [text.removeprefix('chat ') for text in texts[1:]]
     if not found or any(test not in ('Test passed', 'Test failed') for test in tests):
-        return f'{tick} ' + ' | '.join(texts)
-    phase = 'active' if tests[0] == 'Test passed' else 'cooldown' if tests[1] == 'Test passed' else 'inactive'
-    return f'{tick} frequency {found.group(1)} {phase}'
+        return raw, f'unreadable replies {texts}'
+    active, cooldown = (test == 'Test passed' for test in tests)
+    if active and cooldown:
+        return raw, 'both the active and the cooldown phase test passed'
+    return f'{tick} frequency {found.group(1)} {"active" if active else "cooldown" if cooldown else "inactive"}', None
 
 
-def compared(lines):
+def stepped_problems(cases, problems):
+    """Why each stepped case's rows are no complete set of observations: `problems` (from `compared`) plus a row
+    count other than WALK_TICKS. Empty when every one of the WALK_TICKS ticks gave a valid row."""
+    out = {}
+    for case in STEPPED:
+        rows = [r for r in cases.get(case, []) if r[:1] == 't' and r[1:3].isdigit()]
+        found = list(problems.get(case, []))
+        if len(rows) != WALK_TICKS:
+            seen = {r.split(' ', 1)[0] for r in rows}
+            missing = [f't{n:02d}' for n in range(1, WALK_TICKS + 1) if f't{n:02d}' not in seen]
+            gap = f' (missing {", ".join(missing[:5])}{" ..." if len(missing) > 5 else ""})' if missing else ''
+            found.insert(0, f'{len(rows)} stepped rows, not {WALK_TICKS}{gap}')
+        if found:
+            out[case] = found
+    return out
+
+
+def compared(lines, problems=None):
+    """Per case, the lines compared. A stepped case's ticks become one row each; `problems` gets, per case, why a
+    tick's row is no observation (`row`)."""
     cases, ticks = {}, {}
     for line in lines:
         _, step, text = line.split(' ', 2)
@@ -324,7 +350,11 @@ def compared(lines):
             else:
                 cases.setdefault(case, []).append(text)
     for case, rows in ticks.items():
-        cases.setdefault(case, []).extend(row(tick, texts) for tick, texts in rows.items())
+        for tick, texts in rows.items():
+            text, problem = row(tick, texts)
+            cases.setdefault(case, []).append(text)
+            if problem and problems is not None:
+                problems.setdefault(case, []).append(f'{tick}: {problem}')
     return cases
 
 
@@ -363,11 +393,20 @@ def main():
     client = ['java', '-Xmx1g', '-cp', str(classes) + os.pathsep + dependencies, 'dev.horizonlab.parity.KnockbackClient']
 
     world = generate_world(vanilla_server, build)
-    vanilla = compared(run_side('vanilla', vanilla_server, client, build, world))
-    horizon = compared(run_side('horizon', horizon_server, client, build, world))
+    vanilla_problems, horizon_problems = {}, {}
+    vanilla = compared(run_side('vanilla', vanilla_server, client, build, world), vanilla_problems)
+    horizon = compared(run_side('horizon', horizon_server, client, build, world), horizon_problems)
+    unusable = {side: stepped_problems(cases, problems)
+                for side, cases, problems in (('vanilla', vanilla, vanilla_problems),
+                                              ('horizon', horizon, horizon_problems))}
     differ, fixed = [], []
     for case in CASES:
         want, got = vanilla.get(case, []), horizon.get(case, [])
+        bad = [f'{side} {problem}' for side in unusable for problem in unusable[side].get(case, [])]
+        if bad:
+            # Not compared: a row that is no observation on both sides would compare equal and hide a difference.
+            differ.append(f'{case}: the stepped reads are incomplete: ' + '; '.join(bad[:4]))
+            continue
         shown, other = (changes(want), changes(got)) if case in STEPPED else (want, got)
         print(f'{"same  " if want == got else "DIFFER"} {case}: vanilla {shown}' + ('' if want == got else f' horizon {other}'))
         if not want or any(line.startswith(('error', 'disconnected')) for line in want):

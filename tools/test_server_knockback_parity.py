@@ -41,12 +41,12 @@ import time
 try:
     from . import lab, test_rust_parity as base
     from .test_dedicated_server_parity import Server, free_port, game_time, wait_ticks
-    from .test_locator_bar_parity import generate_world, ops_json
+    from .test_locator_bar_parity import ClientOutput, generate_world, ops_json
 except ImportError:
     import lab
     import test_rust_parity as base
     from test_dedicated_server_parity import Server, free_port, game_time, wait_ticks
-    from test_locator_bar_parity import generate_world, ops_json
+    from test_locator_bar_parity import ClientOutput, generate_world, ops_json
 
 NAME = 'server-knockback-parity'
 PLAYERS = ('Alice', 'Bob')
@@ -258,6 +258,9 @@ def server_data(server, selector, path, timeout=120):
 
 
 TICK_STATUS = re.compile(r'The game is (frozen|running)')
+# Seconds a client may take to acknowledge a `sync`: KnockbackClient gives up on a server reply after 30 s and
+# acknowledges anyway, so a client that is silent for longer has stopped.
+SYNC_TIMEOUT = 60
 
 
 def left(deadline, what):
@@ -318,6 +321,7 @@ def run_side(label, server_command, client_command, build, world):
             client = subprocess.Popen([*map(str, client_command), '127.0.0.1', str(port), str(out)],
                                       cwd=lab.ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       stderr=subprocess.STDOUT, text=True)
+            output = ClientOutput(client, log, f'{label} (see {build}/{label}-client.log)')
 
             def sync():
                 """Every script line sent so far has run, and each client holds what its server sent before."""
@@ -325,10 +329,7 @@ def run_side(label, server_command, client_command, build, world):
                     client.stdin.write(f'sync {name}\n')
                 client.stdin.flush()
                 for name in PLAYERS:
-                    while (reply := client.stdout.readline()) != f'synced {name}\n':
-                        if not reply:
-                            raise AssertionError(f'{label}: the client exited (see {build}/{label}-client.log)')
-                        log.write(reply)
+                    output.expect(f'synced {name}', SYNC_TIMEOUT)
 
             def send(line):
                 """A script line for the client, or one of ours: the waits are on the server's game clock, not the
@@ -430,7 +431,9 @@ def run_side(label, server_command, client_command, build, world):
                         send(line)
                     send('ticks 10')
                 send('end')
-                log.write(client.communicate(timeout=60)[0])
+                client.stdin.close()
+                output.drain(60)
+                client.wait(timeout=10)
             finally:
                 if client.poll() is None:
                     client.kill()

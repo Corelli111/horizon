@@ -20,10 +20,12 @@ received in each step are compared exactly: operation, player, style, colour and
 import os
 from pathlib import Path
 import platform
+import queue
 import shutil
 import subprocess
 import sys
 import threading
+import time
 
 try:
     from . import lab, test_rust_parity as base
@@ -147,6 +149,41 @@ def server_dir(directory, world=None, *, port=None):
     return port
 
 
+class ClientOutput:
+    """A script client's stdout, read by one thread from start to exit: the harness waits for an acknowledgment line
+    (`synced NAME`, `dumped now`), with a deadline where it gives one, and every other line goes to the client's
+    log. No second reader ever competes for the pipe, at shutdown either."""
+
+    def __init__(self, process, log, label):
+        self.lines, self.log, self.label = queue.Queue(), log, label
+        threading.Thread(target=self._read, args=(process.stdout,), daemon=True).start()
+
+    def _read(self, stream):
+        for line in stream:
+            self.lines.put(line)
+        self.lines.put(None)
+
+    def _next(self, deadline, what):
+        try:
+            return self.lines.get(timeout=None if deadline is None else max(0.0, deadline - time.time()))
+        except queue.Empty:
+            raise AssertionError(f'{self.label}: {what}') from None
+
+    def expect(self, wanted, timeout=None):
+        """Waits for the line `wanted` (no newline), for at most `timeout` s if given."""
+        deadline = None if timeout is None else time.time() + timeout
+        while (line := self._next(deadline, f'no {wanted!r} from the client in {timeout} s')) != wanted + '\n':
+            if line is None:
+                raise AssertionError(f'{self.label}: the client exited')
+            self.log.write(line)
+
+    def drain(self, timeout):
+        """Everything the client prints until it exits, into its log."""
+        deadline = time.time() + timeout
+        while (line := self._next(deadline, f'the client did not exit in {timeout} s')) is not None:
+            self.log.write(line)
+
+
 class Client:
     """A LocatorBarClient process driven by a script on its stdin. A step ends by the server's clock, not the wall's:
     every script line has run (`sync`), the server has ticked `ticks` more times, and each client holds what the
@@ -158,6 +195,9 @@ class Client:
         self.process = subprocess.Popen([*map(str, command), '127.0.0.1', str(port), str(out)], cwd=lab.ROOT,
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                         text=True)
+        # Harnesses read `process.stdout` themselves until `dump` starts a ClientOutput: from then on it is the
+        # pipe's only reader, through `end`.
+        self.output = None
 
     def tell(self, line):
         self.process.stdin.write(line + '\n')
@@ -169,6 +209,9 @@ class Client:
         for name in names:
             self.tell(f'sync {name}')
         for name in names:
+            if self.output:
+                self.output.expect(f'synced {name}')
+                continue
             while (line := self.process.stdout.readline()) != f'synced {name}\n':
                 if not line:
                     raise AssertionError(f'the client exited (see {self.log.name})')
@@ -180,22 +223,20 @@ class Client:
         self.sync(names)
 
     def dump(self, timeout):
-        """Has the client write its transcript so far: True once it says it has, False after `timeout` s."""
+        """Has the client write its transcript so far, within `timeout` s."""
+        if self.output is None:
+            self.output = ClientOutput(self.process, self.log, f'the client (see {self.log.name})')
         self.tell('dump now')
-        done = threading.Event()
-
-        def read():
-            while line := self.process.stdout.readline():
-                if line == 'dumped now\n':
-                    done.set()
-                    return
-                self.log.write(line)
-        threading.Thread(target=read, daemon=True).start()
-        return done.wait(timeout)
+        self.output.expect('dumped now', timeout)
 
     def end(self):
         self.tell('end')
-        self.log.write(self.process.communicate(timeout=60)[0])
+        if self.output is None:
+            self.log.write(self.process.communicate(timeout=60)[0])
+            return
+        self.process.stdin.close()
+        self.output.drain(60)
+        self.process.wait(timeout=10)
 
     def kill(self):
         if self.process.poll() is None:
@@ -296,16 +337,14 @@ def one_player(name, script, shown, check, scope, step_seconds=4.0, facts=None):
     `check(vanilla's shown lines, vanilla's transcript)` returns why vanilla's run is no proof (the script did
     not run), or None. `facts(server)`, if given, gathers diagnostics from the console while Alice is still there,
     only for the run that matters: vanilla's run `check` accepts, and Horizon's when its lines differ from vanilla's.
-    They are printed with a mismatch, and can never fail or change the comparison."""
+    They are printed with a mismatch and can never fail or change the comparison: with `facts`, what is compared is
+    the transcript the client wrote just before them."""
     lock, build, vanilla_server, horizon_server, client = sides(name)
     ticks = round(step_seconds * 20)
 
-    def sample(server, session, out, expected):
-        """`facts(server)` when this run's transcript so far calls for it (see above), else None."""
+    def sample(server, lines, expected):
+        """`facts(server)` when the transcript `lines` calls for it (see above), else None."""
         try:
-            if not session.dump(10):
-                return 'diagnostics unavailable (no transcript from the client in 10 s)'
-            lines = out.read_text(encoding='utf-8').splitlines()
             wanted = check(shown(lines), lines) is None if expected is None else shown(lines) != expected
             return facts(server) if wanted else None
         except Exception as error:  # diagnostics never decide the outcome
@@ -316,6 +355,7 @@ def one_player(name, script, shown, check, scope, step_seconds=4.0, facts=None):
         port = server_dir(directory, world)
         out = build / f'{label}.txt'
         out.unlink(missing_ok=True)
+        snapshot = None
         server = Server(server_command, directory, label)
         try:
             server.wait_for(r'Done \(')
@@ -331,7 +371,15 @@ def one_player(name, script, shown, check, scope, step_seconds=4.0, facts=None):
                         for action in actions:
                             session.tell(action)
                         session.wait(server, ['Alice'], ticks)
-                    seen[label] = sample(server, session, out, expected) if facts else None
+                    if facts:
+                        # What is compared is this snapshot, taken before the diagnostics: they can't change it.
+                        try:
+                            session.dump(10)
+                            snapshot = out.read_text(encoding='utf-8').splitlines()
+                        except (AssertionError, OSError) as error:
+                            seen[label] = f'diagnostics unavailable ({error})'
+                        else:
+                            seen[label] = sample(server, snapshot, expected)
                     session.end()
                 finally:
                     session.kill()
@@ -339,7 +387,7 @@ def one_player(name, script, shown, check, scope, step_seconds=4.0, facts=None):
             server.stop()
         if not out.exists():
             raise AssertionError(f'{label}: the client wrote no transcript (see {build}/{label}-client.log)')
-        return out.read_text(encoding='utf-8').splitlines()
+        return snapshot if snapshot is not None else out.read_text(encoding='utf-8').splitlines()
 
     seen = {}
     world = generate_world(vanilla_server, build)
