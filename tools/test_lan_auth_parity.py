@@ -23,6 +23,9 @@ def main():
     classes, dependencies, oracle = oh.compile_oracle(
         build, 'VanillaLanAuthOracle', jars, client_libraries(), lock['minecraft']['java_major'])
     oh.java_run(build, classes, dependencies, 'VanillaLanAuthOracle', [], 'vanilla')
+    # Compile apart: under parallel harnesses the build alone outlasts the test's 180 s limit.
+    oh.run_logged(['cargo', 'test', '-p', 'horizon-client-lib', '--lib', '--no-run'],
+                  build, 'compile-rust', timeout=3600)
     oh.run_logged(['cargo', 'test', '-p', 'horizon-client-lib', '--lib',
                    'net::tests::lan_login_continues_after_authentication_failure', '--', '--ignored',
                    '--exact', '--nocapture'],

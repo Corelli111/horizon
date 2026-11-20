@@ -43,6 +43,9 @@ def main():
             HORIZON_SOURCE_SILENCE_OUTPUT=scratch,
             CARGO_BUILD_JOBS=os.environ.get('CARGO_BUILD_JOBS', '2'),
             RUST_TEST_THREADS='2')
+        # Compile apart: under parallel harnesses the build alone outlasts the run's 900 s limit.
+        h.run_logged(['cargo', 'test', '--locked', '-p', 'horizon-client', '--lib', '--no-run'],
+            build, 'compile-rust', timeout=3600, env=env)
         h.run_logged(['cargo', 'test', '--locked', '-p', 'horizon-client', '--lib',
             'game::tnt::tests::silent_', '--', '--ignored', '--nocapture'], build, 'rust', env=env)
         rust = build / 'rust.txt'
