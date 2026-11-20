@@ -12,10 +12,15 @@ pub fn dispatch_failure_counter() -> std::rc::Rc<std::cell::Cell<u64>> {
     DISPATCH_FAILURE_GENERATION.with(std::rc::Rc::clone)
 }
 
-/// Read the failure generation of whichever thread is running the guest call.
+/// Handle for state that can move between threads. Reads follow the thread
+/// running the guest call, so failures on other threads do not affect it.
 #[doc(hidden)]
-pub fn dispatch_failure_generation() -> u64 {
-    DISPATCH_FAILURE_GENERATION.with(|generation| generation.get())
+pub struct DispatchFailures;
+
+impl DispatchFailures {
+    pub fn get(&self) -> u64 {
+        DISPATCH_FAILURE_GENERATION.with(|generation| generation.get())
+    }
 }
 
 /// Mark the failed synchronous dispatch on the same thread as its host effects.

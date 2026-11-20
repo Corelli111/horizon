@@ -35,7 +35,7 @@ impl Game<'_> {
                     pos,
                     placeholder_identity,
                     failure_generation:
-                        horizon_mod_runtime::dispatch_failures::dispatch_failure_generation(),
+                        self.wasm_dispatch_failures.get(),
                     transaction_depth: self.transactions.len(),
                     unbalanced: false,
                 }),

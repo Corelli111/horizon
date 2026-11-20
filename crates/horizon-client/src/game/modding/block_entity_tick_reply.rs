@@ -82,7 +82,7 @@ impl Game<'_> {
             if self.block_entity_tick_key.as_ref().is_none_or(|key| {
                 !key.unbalanced
                     && key.failure_generation
-                        == horizon_mod_runtime::dispatch_failures::dispatch_failure_generation()
+                        == self.wasm_dispatch_failures.get()
             }) {
                 Ok(())
             } else {

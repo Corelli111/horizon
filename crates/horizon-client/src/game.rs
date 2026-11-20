@@ -2043,6 +2043,7 @@ struct Game<'a> {
     player_model: Option<Mob>,
     block_entity_tick_key: Option<block_entity_tick_items::Key>,
     block_entity_tick_items: Option<Box<block_entity_tick_items::Scope>>,
+    wasm_dispatch_failures: horizon_mod_runtime::dispatch_failures::DispatchFailures,
 }
 use horizon_gameplay::dim::Dim;
 /// `Inventory.add` on a player's 36 slots (hotbar first) and off hand,
@@ -10844,6 +10845,7 @@ impl<'a> Game<'a> {
             transactions: Default::default(),
             block_entity_tick_key: None,
             block_entity_tick_items: None,
+            wasm_dispatch_failures: horizon_mod_runtime::dispatch_failures::DispatchFailures,
             contents_changing: Vec::new(),
             mod_screen: None,
             mod_container_viewers: HashMap::new(),
