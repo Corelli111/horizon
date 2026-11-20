@@ -214,7 +214,8 @@ fn inspect_current() -> Result<(), &'static str> {
         if size < REQUIRED {
             // For the main thread libpthread answers the soft stack limit unless the stack it was
             // told about has exactly one guard page: an x86_64 game under Rosetta 2 got 8176 KiB
-            // (the default soft limit) though it links a larger `-stack_size`. The mapping decides.
+            // (the default soft limit) though it links a larger `-stack_size`. The mapping decides:
+            // the room below this frame, which is why macOS links more than REQUIRED.
             let anchor = 0u8;
             let anchor = std::hint::black_box(&raw const anchor).addr();
             let pthread = format!(
@@ -226,8 +227,8 @@ fn inspect_current() -> Result<(), &'static str> {
                 Ok(mapped) if mapped >= REQUIRED => {}
                 Ok(mapped) => {
                     return refuse(format!(
-                        "the main thread has {} KiB of stack, needs {} KiB (its mapped stack \
-                         regions; {pthread})",
+                        "the main thread has {} KiB of stack below this frame, needs {} KiB (its \
+                         mapped stack regions; {pthread})",
                         mapped / 1024,
                         REQUIRED / 1024
                     ));
@@ -403,10 +404,11 @@ struct Region {
 #[cfg(any(target_vendor = "apple", test))]
 const VM_MEMORY_STACK: u32 = 30;
 
-/// The size of the stack holding `anchor`: from the end of the readable and writable stack region
-/// that holds it down through the ones directly below it, to the first gap, guard or region that
-/// isn't a stack's. Stops early once `enough` is reached. `region(address)` is the region holding
-/// `address`, or the next one above it when none does.
+/// The room below `anchor` on the stack holding it: through the readable and writable stack region
+/// that holds it and the ones directly below it, to the first gap, guard or region that isn't a
+/// stack's. What lies above `anchor` is in use, so it never counts. Stops early once `enough` is
+/// reached. `region(address)` is the region holding `address`, or the next one above it when none
+/// does.
 #[cfg(any(target_vendor = "apple", test))]
 fn mapped_stack(
     anchor: usize,
@@ -426,7 +428,8 @@ fn mapped_stack(
         ));
     }
     let mut bottom = holding.start;
-    while holding.end - bottom < enough && bottom > 0 {
+    // Relies on XNU's guard below a main stack: no other stack's region can abut it.
+    while anchor - bottom < enough && bottom > 0 {
         let below = region(bottom - 1)?;
         // A region that doesn't end at `bottom` doesn't hold `bottom - 1`: a gap.
         if below.end != bottom
@@ -438,7 +441,7 @@ fn mapped_stack(
         }
         bottom = below.start;
     }
-    Ok(holding.end - bottom)
+    Ok(anchor - bottom)
 }
 
 #[cfg(target_vendor = "apple")]
@@ -493,7 +496,8 @@ fn soft_stack_limit() -> String {
 
 #[cfg(target_vendor = "apple")]
 unsafe extern "C" {
-    static mach_task_self_: u32;
+    // Written again in a forked child, so mutable: read it by value.
+    static mut mach_task_self_: u32;
     fn mach_vm_region(
         target_task: u32,
         address: *mut u64,
@@ -685,25 +689,40 @@ mod tests {
             read_write: true,
             user_tag: 0,
         };
-        let anchor = top - 64 * 1024;
-        // A linked 136 MiB stack in one region, its guard page below.
-        let linked = vec![
-            region(top - needed - 16 * 1024, top - needed, false),
-            region(top - needed, top, true),
-        ];
+        // Startup's frames use the top 64 KiB; only the room below them counts.
+        let used = 64 * 1024;
+        let anchor = top - used;
+        // macOS links the requirement plus the host headroom (packaging/executable_link.rs).
+        let linked = needed + super::HOST_HEADROOM;
+        let stack = |size| {
+            vec![
+                region(top - size - 16 * 1024, top - size, false),
+                region(top - size, top, true),
+            ]
+        };
         assert_eq!(
-            super::mapped_stack(anchor, needed, query(linked)),
+            super::mapped_stack(anchor, needed, query(stack(linked))),
+            Ok(linked - used)
+        );
+        // A stack of exactly the requirement has less than that below a frame: refused...
+        assert_eq!(
+            super::mapped_stack(anchor, needed, query(stack(needed))),
+            Ok(needed - used)
+        );
+        // ...and one with exactly the requirement below the frame is enough.
+        assert_eq!(
+            super::mapped_stack(anchor, needed, query(stack(needed + used))),
             Ok(needed)
         );
-        // The same stack in two regions counts whole; the size includes what's above the anchor.
+        // The same stack in two regions counts whole.
         let split = vec![
-            region(top - needed - 16 * 1024, top - needed, false),
-            region(top - needed, top - 8 * MIB, true),
+            region(top - linked - 16 * 1024, top - linked, false),
+            region(top - linked, top - 8 * MIB, true),
             region(top - 8 * MIB, top, true),
         ];
         assert_eq!(
             super::mapped_stack(anchor, needed, query(split)),
-            Ok(needed)
+            Ok(linked - used)
         );
         // An 8 MiB stack above a guard stops there, whatever lies below the guard.
         let guarded = vec![
@@ -713,14 +732,17 @@ mod tests {
         ];
         assert_eq!(
             super::mapped_stack(anchor, needed, query(guarded)),
-            Ok(8 * MIB)
+            Ok(8 * MIB - used)
         );
         // A gap below stops it too: the region the query answers lies above the gap.
         let gap = vec![
             region(0x1000, top - 9 * MIB, true),
             region(top - 8 * MIB, top, true),
         ];
-        assert_eq!(super::mapped_stack(anchor, needed, query(gap)), Ok(8 * MIB));
+        assert_eq!(
+            super::mapped_stack(anchor, needed, query(gap)),
+            Ok(8 * MIB - used)
+        );
         // So does a writable mapping right below that isn't a stack's.
         let abutting = vec![
             other(0x1000, top - 8 * MIB),
@@ -728,7 +750,7 @@ mod tests {
         ];
         assert_eq!(
             super::mapped_stack(anchor, needed, query(abutting)),
-            Ok(8 * MIB)
+            Ok(8 * MIB - used)
         );
         // An anchor in a region that isn't a stack's is not measured.
         let untagged = vec![other(top - needed, top)];
