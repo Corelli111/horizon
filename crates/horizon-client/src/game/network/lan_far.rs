@@ -6,7 +6,7 @@
 use super::{Dim, Game};
 use horizon_client::{
     lan::conn::PlayerSender,
-    lod_net::{CHANNEL, Delivery, Job, Verdict},
+    lod_net::{CHANNEL, Delivery, Job, Verdict, refusal, reply_id},
 };
 use horizon_protocol::{
     packets::{configuration::CustomPayload, play},
@@ -91,14 +91,19 @@ impl Game<'_> {
             return;
         };
         let guests = &host.hub.guests;
-        far.deliver(|conn, data| match guests.iter().find(|g| g.conn == conn) {
-            None => Delivery::Gone,
-            Some(g) if host.hub.terrain_protected(conn, &g.dimension) => Delivery::Gone,
-            Some(g) if g.sender.pending.load(Ordering::Relaxed) > BACKLOG => Delivery::Busy,
-            Some(g) => {
-                send(&g.sender, std::mem::take(data));
-                Delivery::Sent
+        far.deliver_in_level(|conn, level, data| {
+            let Some(guest) = guests.iter().find(|g| g.conn == conn) else {
+                return Delivery::Gone;
+            };
+            if guest.sender.pending.load(Ordering::Relaxed) > BACKLOG {
+                return Delivery::Busy;
             }
+            if guest.dimension == level && !host.hub.terrain_protected(conn, level) {
+                send(&guest.sender, std::mem::take(data));
+            } else if let Some(id) = reply_id(data) {
+                send(&guest.sender, refusal(id));
+            }
+            Delivery::Sent
         });
     }
 }
