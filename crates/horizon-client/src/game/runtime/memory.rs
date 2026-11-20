@@ -320,7 +320,8 @@ fn unattributed(resident: Option<u64>, named: usize) -> Option<f64> {
     resident.map(|r| mb_signed(r as i64 - named as i64))
 }
 
-/// `horizon-ctl memory`'s report as a capture's rows: `a.b` paths, `key[name]` for `[name, value]` lists.
+/// `horizon-ctl memory`'s report as a capture's rows: `a.b` paths, `key[name]` for named
+/// lists and `blocks[index]` for GPU blocks in the report's order.
 pub(super) fn flatten_report(report: &Value) -> Vec<(String, f64)> {
     let mut rows = Vec::new();
     flatten(String::new(), report, &mut rows);
@@ -341,15 +342,27 @@ fn flatten(path: String, value: &Value, rows: &mut Vec<(String, f64)>) {
             }
         }
         Value::Array(items) => {
-            for item in items {
-                let Some([Value::String(name), count, rest @ ..]) =
-                    item.as_array().map(Vec::as_slice)
-                else {
-                    continue;
-                };
-                rows.extend(count.as_f64().map(|n| (format!("{path}[{name}]"), n)));
-                if let Some(mb) = rest.first().and_then(Value::as_f64) {
-                    rows.push((format!("{path}_mb[{name}]"), mb));
+            for (index, item) in items.iter().enumerate() {
+                match item.as_array().map(Vec::as_slice) {
+                    Some([Value::String(name), count, rest @ ..]) => {
+                        rows.extend(count.as_f64().map(|n| (format!("{path}[{name}]"), n)));
+                        if let Some(mb) = rest.first().and_then(Value::as_f64) {
+                            rows.push((format!("{path}_mb[{name}]"), mb));
+                        }
+                    }
+                    Some([Value::Number(size), Value::Number(used), Value::Array(_)])
+                        if path == "renderer.gpu.blocks" =>
+                    {
+                        rows.extend(
+                            size.as_f64()
+                                .map(|n| (format!("{path}[{index}].size_mb"), n)),
+                        );
+                        rows.extend(
+                            used.as_f64()
+                                .map(|n| (format!("{path}[{index}].used_mb"), n)),
+                        );
+                    }
+                    _ => {}
                 }
             }
         }
@@ -752,13 +765,14 @@ mod tests {
     }
 
     #[test]
-    fn a_report_flattens_to_paths_and_named_list_entries() {
+    fn a_report_flattens_to_paths_named_list_entries_and_gpu_blocks() {
         let report = json!({
             "process": { "resident_mb": 12.5, "note": "skipped" },
             "render_distance": 16,
             "missing": null,
             "by_label_mb": [["chunks", 3.0], ["bare"]],
             "caches": [["blocks", 7, 1.5]],
+            "renderer": { "gpu": { "blocks": [[16.0, 12.5, ["textures"]], [16.0, 3.0, []]] } },
         });
         let mut rows = flatten_report(&report);
         rows.sort_by(|a, b| a.0.cmp(&b.0));
@@ -768,6 +782,10 @@ mod tests {
             ("caches_mb[blocks]", 1.5),
             ("process.resident_mb", 12.5),
             ("render_distance", 16.0),
+            ("renderer.gpu.blocks[0].size_mb", 16.0),
+            ("renderer.gpu.blocks[0].used_mb", 12.5),
+            ("renderer.gpu.blocks[1].size_mb", 16.0),
+            ("renderer.gpu.blocks[1].used_mb", 3.0),
         ];
         assert_eq!(
             rows.iter()
