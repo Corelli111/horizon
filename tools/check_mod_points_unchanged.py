@@ -170,7 +170,14 @@ def guest_wire_without_hooks(guest, hooks, base):
     the dispatch arms follow that order. A new hook's types take the numbers between the arms around its own: those its
     arm references and, for an owned event (which has no record constructor), numbers no arm references. Each number the
     head has more than the base below a retained reference must lie between the records of the arms before and after an
-    added one's; the retained text then has to match the base exactly."""
+    added one's; the retained text then has to match the base exactly.
+
+    Owned types are invisible here: an owned event or answer has no record constructor, and an answer's type is not
+    even written in its arm. So an owned type an existing hook gains or loses inside an added hook's window is absorbed
+    with the added hook's numbers, and the surface report (tools/ci/surface_report.py) is what fails it: a hook that
+    gains an output or changes its signature is breaking there. An added hook that is the first to use an owned type a
+    later hook already used moves that type's number, so the later numbers shift by less than the ones just after it.
+    That fails here: a number missing after the window looks the same as a later hook losing an owned type."""
     for name in hooks:
         guest, count = re.subn(rf'crate::HookId::\w+ => "{re.escape(name)}",', "", guest)
         if count != 1:
@@ -201,6 +208,9 @@ def guest_wire_without_hooks(guest, hooks, base):
             return None
     used = sorted(pairs)
     gaps = set().union(*(references[index] for index in removed)) - set(used)
+    # Each retained number still above its base number absorbs the unreferenced numbers just below it. Which owned
+    # types those were is not in this file: one an existing hook started to use there passes here, and only the
+    # surface report sees it. A number the head lacks (a surplus below zero) fails, never absorbed.
     for previous, number in zip([-1] + used, used):
         surplus = number - sum(gap < number for gap in gaps) - pairs[number]
         free = [n for n in range(number - 1, previous, -1) if n not in gaps][:max(surplus, 0)]

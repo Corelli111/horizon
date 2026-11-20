@@ -428,8 +428,22 @@ class CompareTests(unittest.TestCase):
     def test_an_added_hook_with_an_owned_event_passes(self):
         # #18539's case: the number the event took is named nowhere, yet the later records are one higher.
         self.assertEqual(self.compare_hook_addition((857, 859, 863, 862), self.OWNED_ARM), 0)
-        with self.subTest("an owned event with an owned field: two numbers"):
+        with self.subTest("the event and a new owned type only it uses: two numbers"):
             self.assertEqual(self.compare_hook_addition((857, 860, 864, 863), self.OWNED_ARM), 0)
+
+    def test_an_owned_type_an_existing_hook_gains_beside_an_added_hook_is_not_seen_here(self):
+        # Not coverage: dimension_transition_screen_draw's answer going from () to a new owned type takes 858 and
+        # leaves its arm's text as it was (`out.put_owned(answer)`), and the added hook's numbers absorb it. This
+        # check passes it; the surface report fails it (the hook gains an output).
+        self.assertEqual(self.compare_hook_addition((857, 860, 864, 863), self.OWNED_ARM), 0)
+        borrowed = self.BORROWED_ARM.replace("__wire_record_858", "__wire_record_859")
+        self.assertEqual(self.compare_hook_addition((857, 860, 864, 863), borrowed), 0)
+
+    def test_an_added_hook_that_first_uses_an_existing_owned_type_fails(self):
+        # Additive, but refused: the added hook is now the first to use an owned type effect_particle_modification
+        # used at 859, so effect's record moves by two and the later ones by one. A number missing after the window
+        # can't be told from a later hook losing an owned type, so this fails rather than open that.
+        self.assertEqual(self.compare_hook_addition((857, 860, 863, 862), self.OWNED_ARM), 1)
 
     def test_a_changed_existing_arm_beside_an_added_hook_fails(self):
         cases = {
