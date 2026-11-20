@@ -207,8 +207,38 @@ fn inspect_current() -> Result<(), &'static str> {
     {
         // SAFETY: pthread_self names the live calling thread.
         let size = unsafe { libc::pthread_get_stacksize_np(libc::pthread_self()) };
-        if size < REQUIRED {
+        // SAFETY: pthread_main_np only reads the calling thread's identity.
+        if size < REQUIRED && unsafe { libc::pthread_main_np() } == 0 {
             return too_small(size, "pthread_get_stacksize_np");
+        }
+        if size < REQUIRED {
+            // For the main thread libpthread answers the soft stack limit unless the stack it was
+            // told about has exactly one guard page: an x86_64 game under Rosetta 2 got 8176 KiB
+            // (the default soft limit) though it links a larger `-stack_size`. The mapping decides.
+            let anchor = 0u8;
+            let anchor = std::hint::black_box(&raw const anchor).addr();
+            let pthread = format!(
+                "pthread_get_stacksize_np says {} KiB, the soft stack limit is {}",
+                size / 1024,
+                soft_stack_limit()
+            );
+            match mapped_stack(anchor, REQUIRED, vm_region) {
+                Ok(mapped) if mapped >= REQUIRED => {}
+                Ok(mapped) => {
+                    return refuse(format!(
+                        "the main thread has {} KiB of stack, needs {} KiB (its mapped stack \
+                         regions; {pthread})",
+                        mapped / 1024,
+                        REQUIRED / 1024
+                    ));
+                }
+                Err(why) => {
+                    return refuse(format!(
+                        "cannot measure the main thread's stack: {why}; needs {} KiB ({pthread})",
+                        REQUIRED / 1024
+                    ));
+                }
+            }
         }
     }
     #[cfg(windows)]
@@ -357,6 +387,106 @@ fn main_stack_room(
         (soft_limit, StackBound::Limit)
     };
     (reach.saturating_sub(top.saturating_sub(used_from)), bound)
+}
+
+/// A region of the address space as `mach_vm_region` answers it.
+#[cfg(any(target_vendor = "apple", test))]
+#[derive(Clone, Copy, Debug)]
+struct Region {
+    start: usize,
+    end: usize,
+    read_write: bool,
+}
+
+/// The size of the stack holding `anchor`: from the end of the readable and writable region that
+/// holds it down through the ones directly below it, to the first gap or guard (a stack's lowest
+/// page is a guard). Stops early once `enough` is reached. `region(address)` is the region holding
+/// `address`, or the next one above it when none does.
+#[cfg(any(target_vendor = "apple", test))]
+fn mapped_stack(
+    anchor: usize,
+    enough: usize,
+    mut region: impl FnMut(usize) -> Result<Region, String>,
+) -> Result<usize, String> {
+    let holding = region(anchor)?;
+    if !(holding.start..holding.end).contains(&anchor) || !holding.read_write {
+        return Err(format!(
+            "no readable and writable region holds the stack address {anchor:#x}"
+        ));
+    }
+    let mut bottom = holding.start;
+    while holding.end - bottom < enough && bottom > 0 {
+        let below = region(bottom - 1)?;
+        // A region that doesn't end at `bottom` doesn't hold `bottom - 1`: a gap.
+        if below.end != bottom || below.start >= bottom || !below.read_write {
+            break;
+        }
+        bottom = below.start;
+    }
+    Ok(holding.end - bottom)
+}
+
+#[cfg(target_vendor = "apple")]
+fn vm_region(address: usize) -> Result<Region, String> {
+    // <mach/vm_region.h>: the flavor, and its info's size in ints (vm_region_basic_info_64 is
+    // packed to 4 bytes: 36 bytes). Its first field is the region's current protection.
+    const VM_REGION_BASIC_INFO_64: libc::c_int = 9;
+    let mut info: [libc::c_int; 9] = [0; 9];
+    let mut count = info.len() as u32;
+    let mut start = address as u64;
+    let mut size: u64 = 0;
+    let mut object_name: u32 = 0;
+    // SAFETY: every out pointer is writable, and count is info's length in ints.
+    let result = unsafe {
+        mach_vm_region(
+            mach_task_self_,
+            &mut start,
+            &mut size,
+            VM_REGION_BASIC_INFO_64,
+            info.as_mut_ptr(),
+            &mut count,
+            &mut object_name,
+        )
+    };
+    if result != 0 {
+        return Err(format!("mach_vm_region failed (kern_return_t {result})"));
+    }
+    let read_write = libc::VM_PROT_READ | libc::VM_PROT_WRITE;
+    Ok(Region {
+        start: start as usize,
+        end: start.saturating_add(size) as usize,
+        read_write: info[0] & read_write == read_write,
+    })
+}
+
+#[cfg(target_vendor = "apple")]
+fn soft_stack_limit() -> String {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: limit is writable and getrlimit initializes it on success.
+    if unsafe { libc::getrlimit(libc::RLIMIT_STACK, &mut limit) } != 0 {
+        "unknown".to_owned()
+    } else if limit.rlim_cur == libc::RLIM_INFINITY {
+        "unlimited".to_owned()
+    } else {
+        format!("{} KiB", limit.rlim_cur / 1024)
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+unsafe extern "C" {
+    static mach_task_self_: u32;
+    fn mach_vm_region(
+        target_task: u32,
+        address: *mut u64,
+        size: *mut u64,
+        flavor: libc::c_int,
+        info: *mut libc::c_int,
+        count: *mut u32,
+        object_name: *mut u32,
+    ) -> libc::c_int;
 }
 
 #[cfg(windows)]
@@ -508,6 +638,81 @@ mod tests {
         }
         stat.extend_from_slice(b" 3221225472 29\n");
         assert_eq!(super::start_stack(&stat), Some(0xc000_0000));
+    }
+
+    #[test]
+    fn the_mapped_stack_ends_at_a_guard_or_a_gap() {
+        use super::Region;
+        const MIB: usize = 1024 * 1024;
+        let needed = super::GUEST_STACK_BYTES + super::HOST_HEADROOM;
+        let top: usize = 0xc000_0000;
+        // `mach_vm_region`: the region holding the address, or the next one above it.
+        let query = |regions: Vec<Region>| {
+            move |address: usize| {
+                regions
+                    .iter()
+                    .copied()
+                    .find(|region| address < region.end)
+                    .ok_or_else(|| "none above".to_owned())
+            }
+        };
+        let region = |start, end, read_write| Region {
+            start,
+            end,
+            read_write,
+        };
+        let anchor = top - 64 * 1024;
+        // A linked 136 MiB stack in one region, its guard page below.
+        let linked = vec![
+            region(top - needed - 16 * 1024, top - needed, false),
+            region(top - needed, top, true),
+        ];
+        assert_eq!(
+            super::mapped_stack(anchor, needed, query(linked)),
+            Ok(needed)
+        );
+        // The same stack in two regions counts whole; the size includes what's above the anchor.
+        let split = vec![
+            region(top - needed - 16 * 1024, top - needed, false),
+            region(top - needed, top - 8 * MIB, true),
+            region(top - 8 * MIB, top, true),
+        ];
+        assert_eq!(
+            super::mapped_stack(anchor, needed, query(split)),
+            Ok(needed)
+        );
+        // An 8 MiB stack above a guard stops there, whatever lies below the guard.
+        let guarded = vec![
+            region(0x1000, top - 64 * MIB, true),
+            region(top - 64 * MIB, top - 8 * MIB, false),
+            region(top - 8 * MIB, top, true),
+        ];
+        assert_eq!(
+            super::mapped_stack(anchor, needed, query(guarded)),
+            Ok(8 * MIB)
+        );
+        // A gap below stops it too: the region the query answers lies above the gap.
+        let gap = vec![
+            region(0x1000, top - 9 * MIB, true),
+            region(top - 8 * MIB, top, true),
+        ];
+        assert_eq!(super::mapped_stack(anchor, needed, query(gap)), Ok(8 * MIB));
+        // The anchor in no region, or in a guard, is not measured.
+        let below = vec![region(top - 8 * MIB, top, true)];
+        assert!(super::mapped_stack(top - 9 * MIB, needed, query(below)).is_err());
+        let in_guard = vec![region(top - 8 * MIB, top, false)];
+        assert!(super::mapped_stack(anchor, needed, query(in_guard)).is_err());
+        // A failed query below is not measured either.
+        let mut calls = 0;
+        let failing = |address: usize| {
+            calls += 1;
+            if calls == 1 {
+                Ok(region(top - 8 * MIB, top, true))
+            } else {
+                Err(format!("no answer for {address:#x}"))
+            }
+        };
+        assert!(super::mapped_stack(anchor, needed, failing).is_err());
     }
 
     #[test]
