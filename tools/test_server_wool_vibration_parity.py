@@ -18,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -27,13 +28,13 @@ try:
     from . import lab, test_rust_parity as base
     from .test_dedicated_server_parity import Server, game_time, wait_ticks
     from .test_locator_bar_parity import generate_world
-    from .test_server_knockback_parity import server_data, server_dir
+    from .test_server_knockback_parity import server_dir
 except ImportError:
     import lab
     import test_rust_parity as base
     from test_dedicated_server_parity import Server, game_time, wait_ticks
     from test_locator_bar_parity import generate_world
-    from test_server_knockback_parity import server_data, server_dir
+    from test_server_knockback_parity import server_dir
 
 NAME = 'server-wool-vibration-parity'
 KNOWN = {}
@@ -188,6 +189,20 @@ for name, kind, nbt in (
                    'step setup']
 
 
+def position(server, timeout=2.0):
+    """Alice's position, asked from the console, or None if no reply came in `timeout` s: the caller asks again
+    (Horizon's server left one unanswered within 120 s on a hosted run, 11-20)."""
+    start = len(server.lines)
+    server.console('data get entity Alice Pos')
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for line in server.lines[start:]:
+            if found := re.search(r'entity data: \[(.*)\]', line):
+                return [float(v.strip().rstrip('d')) for v in found.group(1).split(',')]
+        time.sleep(0.02)
+    return None
+
+
 def run_side(label, server_command, client_command, build, world):
     directory = build / label
     port = server_dir(directory, world)
@@ -224,6 +239,8 @@ def run_side(label, server_command, client_command, build, world):
                     while game_time(server) != game_time(server):
                         pass
                 elif word == 'unfreeze':
+                    # After the reads before it have run: `cmd` lines are only queued on the client.
+                    sync()
                     server.console('tick unfreeze')
                     sync()
                 elif word == 'moved':
@@ -231,11 +248,7 @@ def run_side(label, server_command, client_command, build, world):
                     sync()
                     x, y = map(float, line.split()[1:3])
                     deadline = time.time() + 30
-                    while True:
-                        reply = server_data(server, 'Alice', 'Pos')
-                        pos = [float(v.strip().rstrip('d')) for v in reply.strip('[]').split(',')]
-                        if abs(pos[0] - x) < 1e-6 and abs(pos[1] - y) < 1e-6:
-                            break
+                    while (pos := position(server)) is None or abs(pos[0] - x) > 1e-6 or abs(pos[1] - y) > 1e-6:
                         if time.time() > deadline:
                             raise AssertionError(f'{label}: Alice is at {pos}, not at x {x} y {y}, 30 s after moving')
                         time.sleep(0.02)
@@ -278,7 +291,9 @@ def compared(lines):
     for line in lines:
         _, step, text = line.split(' ', 2)
         step = step.removeprefix('step=')
-        if step in CASES and text.startswith(('chat ', 'teleport ', 'error', 'disconnected')):
+        # `[Server: ...]` is the server echoing the console's `tick` commands to an operator: not under test.
+        if step in CASES and text.startswith(('chat ', 'teleport ', 'error', 'disconnected')) \
+                and not text.startswith('chat [Server: '):
             cases.setdefault(step, []).append(text)
     return cases
 
