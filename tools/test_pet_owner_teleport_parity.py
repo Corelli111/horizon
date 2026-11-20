@@ -13,6 +13,7 @@ can be 6 to 12 blocks from her a few seconds later, in vanilla as in Horizon; a 
 """
 import re
 import sys
+import time
 
 try:
     from . import test_locator_bar_parity as locator
@@ -65,10 +66,32 @@ def check(vanilla, vanilla_all):
     return None
 
 
+def facts(server):
+    """Where each wolf and Alice are and what the free wolf rides, asked from the console at the end: printed when
+    the sides differ, to tell a wolf that never came from one that came and wandered off (#18133)."""
+    def ask(command):
+        start = len(server.lines)
+        server.console(command)
+        server.console('time query gametime')
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            replies = [line.split(']: ', 1)[-1] for line in server.lines[start:]]
+            for index, reply in enumerate(replies):
+                if re.search(r'The (?:game )?time is \d+', reply):
+                    return '; '.join(replies[:index]) or 'none'
+            time.sleep(0.05)
+        return 'no reply'
+    found = [f'{pet} wolf: {ask(f"data get entity @e[type=minecraft:wolf,tag={pet},limit=1] Pos")}' for pet in PETS]
+    found.append(f'Alice: {ask("data get entity Alice Pos")}')
+    found.append('free wolf vehicle: ' + ask('execute as @e[type=minecraft:wolf,tag=free,limit=1] on vehicle '
+                                             'run data get entity @s Pos'))
+    return ' | '.join(found)
+
+
 def main():
     lines = locator.one_player(NAME, SCRIPT, shown, check, 'Tame wolves (free, leashed, in a boat) left 40 blocks '
                                'behind by their owner on a dedicated server: which ones teleport to her.',
-                               step_seconds=5.0)
+                               step_seconds=5.0, facts=facts)
     print(f'pet owner teleport: {len(lines)} lines identical')
 
 

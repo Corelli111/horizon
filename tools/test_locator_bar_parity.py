@@ -275,11 +275,12 @@ def sides(name, binary=None):
 VANILLA_ATTEMPTS = 5
 
 
-def one_player(name, script, shown, check, scope, step_seconds=4.0):
+def one_player(name, script, shown, check, scope, step_seconds=4.0, facts=None):
     """A harness of one player, Alice: on each server she joins, then runs `script`, a list of (step, client
     actions) that each last `step_seconds` of the server's time (20 ticks a second). The lines `shown(transcript)` keeps must match vanilla's exactly, and
     `check(vanilla's shown lines, vanilla's transcript)` returns why vanilla's run is no proof (the script did
-    not run), or None."""
+    not run), or None. `facts(server)`, if given, is asked after the script while Alice is still there, and what it
+    returns for each side is printed when they differ."""
     lock, build, vanilla_server, horizon_server, client = sides(name)
     ticks = round(step_seconds * 20)
 
@@ -303,6 +304,7 @@ def one_player(name, script, shown, check, scope, step_seconds=4.0):
                         for action in actions:
                             session.tell(action)
                         session.wait(server, ['Alice'], ticks)
+                    seen[label] = facts(server) if facts else None
                     session.end()
                 finally:
                     session.kill()
@@ -312,6 +314,7 @@ def one_player(name, script, shown, check, scope, step_seconds=4.0):
             raise AssertionError(f'{label}: the client wrote no transcript (see {build}/{label}-client.log)')
         return out.read_text(encoding='utf-8').splitlines()
 
+    seen = {}
     world = generate_world(vanilla_server, build)
     # Vanilla's run is the specification only when `check` accepts it. On a loaded machine a real-time step can
     # miss its moment (a bobber that lands before the armor stand is there), so a run it rejects is made again,
@@ -331,7 +334,8 @@ def one_player(name, script, shown, check, scope, step_seconds=4.0):
         import difflib
         diff = '\n'.join(difflib.unified_diff(vanilla, horizon, 'vanilla', 'horizon', n=1, lineterm=''))
         raise AssertionError(f'{len(errors)} errors, transcripts differ (see {build}/vanilla.txt and horizon.txt):\n'
-                             + '\n'.join(errors[:10]) + '\n' + diff[:6000])
+                             + '\n'.join(errors[:10]) + '\n' + diff[:6000]
+                             + ''.join(f'\n{side}: {seen[side]}' for side in ('vanilla', 'horizon') if seen.get(side)))
     lab.write_json(build / 'report.json', dict(
         schema=1, minecraft=lock['minecraft']['version'], platform=platform.platform(),
         java=subprocess.check_output(['java', '--version'], text=True).splitlines()[0],

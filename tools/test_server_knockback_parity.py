@@ -22,8 +22,9 @@ players made of vanilla's protocol code, joins them both and runs one script on 
 
 The script waits on the server, not on the wall: `ticks N` is N ticks of its game clock (with a `sync` round trip
 before and after, so each client holds what the server sent), `tickstep` is one `/tick step` that has run, `frozen`
-a frozen game that has stopped, and `hit` a hit that has landed (a frozen server still ticks its players, so a hit
-lands in Alice's next tick). A server that stalls under load gets the same ticks as an idle one.
+a frozen game that has stopped, `hit` a hit that has landed (a frozen server still ticks its players, so a hit
+lands in Alice's next tick), and `blast` a right click whose blast has moved a given entity (test_bed_explosion_parity).
+A server that stalls under load gets the same ticks as an idle one.
 
 Each case is compared on its own. KNOWN lists the cases Horizon still gets wrong and why; one that matches
 again is reported, and should leave the list.
@@ -319,6 +320,22 @@ def run_side(label, server_command, client_command, build, world):
                     client.stdin.write(f'attack Alice {line.split()[1]}\n')
                     client.stdin.flush()
                     while server_data(server, mob, 'Motion') == before:
+                        time.sleep(0.05)
+                    sync()
+                elif word == 'blast':
+                    # `blast X Y Z SELECTOR`: Alice right-clicks the block's top, and the wait ends once the blast
+                    # has moved the selected entity. Like a hit, a frozen server may apply the click in Alice's
+                    # next tick, not when the packet arrives.
+                    sync()
+                    x, y, z, selector = line.split()[1:5]
+                    before = server_data(server, selector, 'Motion')
+                    client.stdin.write(f'useblock Alice {x} {y} {z}\n')
+                    client.stdin.flush()
+                    deadline = time.time() + 30
+                    while server_data(server, selector, 'Motion') == before:
+                        if time.time() > deadline:
+                            raise AssertionError(f'{server.log_path.name}: the click on {x} {y} {z} did not move '
+                                                 f'{selector} in 30 s')
                         time.sleep(0.05)
                     sync()
                 elif word == 'waitage':
