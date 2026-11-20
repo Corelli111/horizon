@@ -212,7 +212,7 @@ fn terrain_views_filter_shared_batches_deltas_metadata_and_corrections() {
         initial(&packets[0]).unwrap().chunk.buffer,
         initial(&packets[1]).unwrap().chunk.buffer
     );
-    assert_eq!(hub.terrain.as_ref().unwrap().resident.submitted, 2);
+    assert_eq!(hub.terrain.as_ref().unwrap().resident.submitted, 1);
 
     hub.send_block_correction(1, &world, CHEST);
     assert_eq!(

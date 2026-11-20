@@ -1,5 +1,5 @@
 //! Prepared terrain rules and bounded resident-column work for outbound terrain.
-use super::chunks::{ChunkEncoder, TerrainWires};
+use super::chunks::{ChunkEncoder, TerrainEncoder, TerrainWires};
 use crate::{
     chunk::Chunk,
     fast_hash::{FxHashMap, FxHashSet},
@@ -334,7 +334,7 @@ struct Job {
     identity: Identity,
     chunk: Arc<Chunk>,
     neighbours: Neighbours,
-    encoder: ChunkEncoder,
+    encoder: TerrainEncoder,
     rules: Arc<Rules>,
 }
 
@@ -362,11 +362,8 @@ impl Worker {
                         let Ok(job) = work.lock().unwrap().recv() else {
                             return;
                         };
-                        let wires = Arc::new(job.encoder.terrain_wires(
-                            &job.chunk,
-                            &job.neighbours,
-                            &job.rules,
-                        ));
+                        let wires =
+                            Arc::new(job.encoder.encode(&job.chunk, &job.neighbours, &job.rules));
                         if reply.send((job.key, job.identity, wires)).is_err() {
                             return;
                         }
@@ -383,6 +380,7 @@ pub(super) struct Resident {
     #[cfg(test)]
     pub(in crate::lan) submitted: usize,
     worker: Option<Worker>,
+    unchanged: Arc<TerrainWires>,
     dimension: Option<Arc<str>>,
     // Every candidate is checked or queued once per level pass, even while many guests share
     // the same queue at spawn. None means the work is still pending or the queue had no room.
@@ -465,7 +463,15 @@ impl Resident {
             self.cache.remove(key);
             self.ordering.retain(|k| k != key);
         }
-        if self.pending.len() == IN_FLIGHT || self.pending.contains(key) {
+        if self.pending.contains(key) {
+            return None;
+        }
+        // With no eligible state in this column, neighbours cannot change its view.
+        // Use the ordinary section cache without waiting for encoder capacity.
+        if !encoder.terrain_eligible(chunk, &rules) {
+            return Some(self.unchanged.clone());
+        }
+        if self.pending.len() == IN_FLIGHT {
             return None;
         }
         let neighbours = neighbours(world, at);
@@ -482,7 +488,7 @@ impl Resident {
                 identity: keys,
                 chunk: chunk.clone(),
                 neighbours,
-                encoder: encoder.detached(),
+                encoder: encoder.terrain_encoder(),
                 rules,
             })
             .is_ok()

@@ -380,9 +380,80 @@ impl Warm {
 /// Columns below which their bodies are written on the tick's thread alone.
 const BODIES_MIN: usize = 4;
 
-/// A column's body with what reads the level done: its sections' bytes, its
-/// heightmaps and its block entities. What is left, the light layers and the
-/// writing, reads only its own sections, so any thread can finish it.
+/// The immutable inputs a worker needs to project and serialize sections.
+pub(super) struct TerrainEncoder {
+    coder: Arc<SectionCoder>,
+    sections: std::ops::Range<usize>,
+}
+
+fn eligible_terrain_section(section: &Section, y: i32, rules: &Rules) -> bool {
+    let uniform = section.blocks.uniform();
+    let palette = uniform
+        .as_ref()
+        .map(std::slice::from_ref)
+        .or_else(|| section.blocks.palette());
+    rules.eligible(y, palette)
+}
+
+impl TerrainEncoder {
+    pub(super) fn encode(
+        &self,
+        chunk: &Chunk,
+        neighbours: &Neighbours,
+        rules: &Rules,
+    ) -> TerrainWires {
+        let own = (chunk.x, chunk.z);
+        let wires = self
+            .sections
+            .clone()
+            .map(|i| {
+                let section = &chunk.sections[i];
+                let y = chunk.min_y() + 16 * i as i32;
+                if !eligible_terrain_section(section, y, rules) {
+                    return None;
+                }
+                let mut original = [0; 4096];
+                section.unpack(&mut original);
+                let mut values = original;
+                for (index, value) in values.iter_mut().enumerate() {
+                    let x = chunk.x * 16 + (index & 15) as i32;
+                    let z = chunk.z * 16 + (index >> 4 & 15) as i32;
+                    let pos = (x, y + (index >> 8) as i32, z);
+                    *value = rules.state(pos, *value, |p @ (x, ny, z)| {
+                        if (y..y + 16).contains(&ny) && terrain_view::column(p) == own {
+                            return Some(original[crate::chunk::index(x, ny, z)]);
+                        }
+                        if terrain_view::column(p) == own {
+                            return terrain_view::known(chunk, x, ny, z);
+                        }
+                        let (_, other) = terrain_view::adjacent(own)
+                            .zip(neighbours)
+                            .find(|(key, _)| *key == terrain_view::column(p))?;
+                        terrain_view::known(other.as_deref()?, x, ny, z)
+                    });
+                }
+                if original == values {
+                    return None;
+                }
+                let section = Section {
+                    blocks: Section::from_blocks(&values),
+                    biomes: section.biomes.clone(),
+                    light: Light::Uniform(0),
+                };
+                let (encoded, mut entities) = self.coder.section(&section);
+                // Even a replacement that has the same entity kind must not expose the original tag.
+                entities.retain(|&(i, state)| original[usize::from(i)] == state);
+                let mut writer = Writer::new();
+                encoded.write(&mut writer);
+                Some((writer.data.into(), entities.into()))
+            })
+            .collect();
+        TerrainWires(wires)
+    }
+}
+
+/// The transformed sections of a column. Missing entries use the ordinary section cache.
+#[derive(Default)]
 pub(super) struct TerrainWires(Vec<Option<Warmed>>);
 
 impl TerrainWires {
@@ -397,6 +468,8 @@ impl TerrainWires {
     }
 }
 
+/// A column's body with what reads the level done: its sections' bytes, heightmaps and tags.
+/// The light layers and the final write only read immutable data.
 struct Prepared {
     x: i32,
     z: i32,
@@ -975,66 +1048,18 @@ impl ChunkEncoder {
         self.body(chunk, &world.block_entities, SectionMask::ALL)
     }
 
-    pub(super) fn terrain_wires(
-        &self,
-        chunk: &Chunk,
-        neighbours: &Neighbours,
-        rules: &Rules,
-    ) -> TerrainWires {
-        let own = (chunk.x, chunk.z);
-        let wires = self
-            .sections
-            .clone()
-            .map(|i| {
-                let section = &chunk.sections[i];
-                let y = chunk.min_y() + 16 * i as i32;
-                let uniform = section.blocks.uniform();
-                let palette = uniform.as_slice();
-                let palette = if palette.is_empty() {
-                    section.blocks.palette()
-                } else {
-                    Some(palette)
-                };
-                if !rules.eligible(y, palette) {
-                    return None;
-                }
-                let mut original = [0; 4096];
-                section.unpack(&mut original);
-                let mut values = original;
-                for (index, value) in values.iter_mut().enumerate() {
-                    let x = chunk.x * 16 + (index & 15) as i32;
-                    let z = chunk.z * 16 + (index >> 4 & 15) as i32;
-                    let pos = (x, y + (index >> 8) as i32, z);
-                    *value = rules.state(pos, *value, |p @ (x, ny, z)| {
-                        if (y..y + 16).contains(&ny) && terrain_view::column(p) == own {
-                            return Some(original[crate::chunk::index(x, ny, z)]);
-                        }
-                        if terrain_view::column(p) == own {
-                            return terrain_view::known(chunk, x, ny, z);
-                        }
-                        let (_, other) = terrain_view::adjacent(own)
-                            .zip(neighbours)
-                            .find(|(key, _)| *key == terrain_view::column(p))?;
-                        terrain_view::known(other.as_deref()?, x, ny, z)
-                    });
-                }
-                if original == values {
-                    return None;
-                }
-                let section = Section {
-                    blocks: Section::from_blocks(&values),
-                    biomes: section.biomes.clone(),
-                    light: Light::Uniform(0),
-                };
-                let (encoded, mut entities) = self.coder.section(&section);
-                // Even a replacement that has the same entity kind must not expose the original tag.
-                entities.retain(|&(i, state)| original[usize::from(i)] == state);
-                let mut writer = Writer::new();
-                encoded.write(&mut writer);
-                Some((writer.data.into(), entities.into()))
-            })
-            .collect();
-        TerrainWires(wires)
+    /// Resident transforms read only the section coder and level range.
+    pub(super) fn terrain_encoder(&self) -> TerrainEncoder {
+        TerrainEncoder {
+            coder: self.coder.clone(),
+            sections: self.sections.clone(),
+        }
+    }
+
+    pub(super) fn terrain_eligible(&self, chunk: &Chunk, rules: &Rules) -> bool {
+        self.sections.clone().any(|i| {
+            eligible_terrain_section(&chunk.sections[i], chunk.min_y() + 16 * i as i32, rules)
+        })
     }
 
     pub(super) fn terrain_body(
@@ -1060,7 +1085,7 @@ impl ChunkEncoder {
         neighbours: &Neighbours,
         rules: &Rules,
     ) -> Vec<u8> {
-        let wires = self.terrain_wires(chunk, neighbours, rules);
+        let wires = self.terrain_encoder().encode(chunk, neighbours, rules);
         let entities = chunk.block_entities.iter().cloned().collect();
         self.prepare_view(chunk, &entities, SectionMask::ALL, Some(&wires))
             .write()
@@ -1356,7 +1381,7 @@ impl ChunkEncoder {
             .take(self.sections.len())
         {
             let (encoded, entities) = view
-                .and_then(|view| view.0[i - self.sections.start].clone())
+                .and_then(|view| view.0.get(i - self.sections.start)?.clone())
                 .unwrap_or_else(|| self.section_wire(s));
             // The section's block entity blocks, kept with its bytes, in the
             // order a scan of every block would find them.
