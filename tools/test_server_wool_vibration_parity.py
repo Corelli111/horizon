@@ -3,8 +3,8 @@
 
 A vanilla dedicated server and Horizon's each serve a copy of one flat world. KnockbackClient, a player made of
 vanilla's protocol code, sends the positions a real client sends for a jump, a drop and a walk, sneaking or not, on
-stone (the control), wool, a wool carpet and a wool slab, and beside a hole at a block's edge. A cow, an item and an
-armor stand fall on the same floors. A sculk sensor stands three blocks away, and a shrieker beside it in two cases.
+stone (the control), wool, a wool carpet and a wool slab, and beside a hole at a block's edge; a walk runs with
+ticking frozen, one position a stepped tick (`walk`). A cow, an item and an armor stand fall on the same floors. A sculk sensor stands three blocks away, and a shrieker beside it in two cases.
 
 After each case the sensor's `last_vibration_frequency` and phase (and the shrieker's state) are read with commands.
 A player hurt on each floor is the positive control: the same sensor hears it, so a silent sensor on wool is the
@@ -25,15 +25,15 @@ import time
 
 try:
     from . import lab, test_rust_parity as base
-    from .test_dedicated_server_parity import Server, wait_ticks
+    from .test_dedicated_server_parity import Server, game_time, wait_ticks
     from .test_locator_bar_parity import generate_world
-    from .test_server_knockback_parity import server_dir
+    from .test_server_knockback_parity import server_data, server_dir
 except ImportError:
     import lab
     import test_rust_parity as base
-    from test_dedicated_server_parity import Server, wait_ticks
+    from test_dedicated_server_parity import Server, game_time, wait_ticks
     from test_locator_bar_parity import generate_world
-    from test_server_knockback_parity import server_dir
+    from test_server_knockback_parity import server_data, server_dir
 
 NAME = 'server-wool-vibration-parity'
 KNOWN = {}
@@ -80,7 +80,15 @@ def drop(x, ground, height=1.25):
 
 
 def walk(x, ground):
-    return [line for i in range(1, 21) for line in at(round(x + 0.2 * i, 3), ground, True)]
+    """Twenty positions 0.2 blocks apart, one a game tick, with ticking frozen (player_case) and stepped once per
+    position: the step's vibration and the read 12 ticks after the last position land on the same ticks on both
+    servers. In real time the read came within a few ticks of the end of the sensor's 30 active ticks (ticks 11 to
+    40 after the first position on both servers, stepped), and missed it on a loaded machine (#18133)."""
+    lines = []
+    for i in range(1, 21):
+        x_i = round(x + 0.2 * i, 3)
+        lines += [f'pos Alice {x_i} {ground} {START[1]} 0 0 1', f'moved {x_i} {ground}', 'tickstep 1']
+    return lines
 
 
 def arena(floor):
@@ -118,13 +126,18 @@ def player_case(case, floor, action, sneak=False, shrieker=False):
     if sneak:
         lines += ['sneak Alice on', 'sleep 0.1']
     lines += [*sensor(shrieker), 'ticks 5', f'step {case}', FREQUENCY]
+    stepped = action is walk
     if action == 'hurt':
         lines.append('cmd Alice damage @s 1 minecraft:generic')
+    elif stepped:
+        lines += ['freeze', *action(x, ground)]
     else:
         lines += action(x, ground)
-    lines += ['ticks 12', FREQUENCY, PHASE]
+    lines += ['tickstep 12' if stepped else 'ticks 12', FREQUENCY, PHASE]
     if shrieker:
         lines.append(SHRIEKING)
+    if stepped:
+        lines.append('unfreeze')
     lines += ['step setup', 'cmd Alice effect give @s minecraft:instant_health 1 5 true']
     if sneak:
         lines += ['sneak Alice off', 'sleep 0.1']
@@ -203,6 +216,40 @@ def run_side(label, server_command, client_command, build, world):
                 elif word == 'ticks':
                     sync()
                     wait_ticks(server, int(line.split()[1]))
+                    sync()
+                elif word == 'freeze':
+                    # Frozen once the tick in flight has finished: the clock reads the same twice.
+                    sync()
+                    server.console('tick freeze')
+                    while game_time(server) != game_time(server):
+                        pass
+                elif word == 'unfreeze':
+                    server.console('tick unfreeze')
+                    sync()
+                elif word == 'moved':
+                    # A frozen server may apply a position in the player's next tick, not when it arrives.
+                    sync()
+                    x, y = map(float, line.split()[1:3])
+                    deadline = time.time() + 30
+                    while True:
+                        reply = server_data(server, 'Alice', 'Pos')
+                        pos = [float(v.strip().rstrip('d')) for v in reply.strip('[]').split(',')]
+                        if abs(pos[0] - x) < 1e-6 and abs(pos[1] - y) < 1e-6:
+                            break
+                        if time.time() > deadline:
+                            raise AssertionError(f'{label}: Alice is at {pos}, not at x {x} y {y}, 30 s after moving')
+                        time.sleep(0.02)
+                elif word == 'tickstep':
+                    # `/tick step N` answers at once and the ticks run after: the clock says when they have.
+                    sync()
+                    ticks = int(line.split()[1])
+                    until = game_time(server) + ticks
+                    server.console(f'tick step {ticks}')
+                    deadline = time.time() + 60
+                    while game_time(server) < until:
+                        if time.time() > deadline:
+                            raise AssertionError(f'{label}: /tick step {ticks} did not run in 60 s')
+                        time.sleep(0.02)
                     sync()
                 else:
                     client.stdin.write(line + '\n')
